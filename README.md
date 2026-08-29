@@ -1,20 +1,43 @@
 # judytin
 
 A [TinTin++](https://tintin.mudhalla.net/)-style MUD client, built for
-[judymud](../judymud) but happy on any MUD. One small Rust binary, three
-dependencies (crossterm, rustls, sha2), and the tt++ scripting dialect your
-muscle memory already knows.
+judymud but happy on any MUD. One small Rust binary, three dependencies
+(crossterm, rustls, sha2), and the tt++ scripting dialect your muscle
+memory already knows.
 
 ## Quick start
 
+Needs a Rust toolchain (1.88 or newer; [rustup](https://rustup.rs) is the
+usual way). Then:
+
 ```
-cargo build --release
-./target/release/judytin                  # connects to 127.0.0.1:2323 (judymud)
-./target/release/judytin -r judymud.tin   # same, with the starter script
-./target/release/judytin some.mud.org 4000
-./target/release/judytin --tls mudhost    # telnet-over-TLS (port 2324)
-./target/release/judytin --ssh grib@mudhost:2322   # your ssh key is your character
+git clone https://github.com/slug23/judytin
+cd judytin
+cargo install --path .
 ```
+
+That builds it and drops a `judytin` binary in `~/.cargo/bin`, which rustup
+already put on your PATH — so from here on it is just `judytin`, from any
+directory:
+
+```
+judytin                            # connects to 127.0.0.1:2323 (judymud)
+judytin -r judymud.tin             # starter script (from the clone directory)
+judytin some.mud.org 4000
+judytin --tls mudhost              # telnet-over-TLS (port 2324)
+judytin --ssh grib@mudhost:2322    # your ssh key is your character
+```
+
+`judymud.tin` stays in the clone, so `-r judymud.tin` finds it only from
+there; give a full path, or copy its contents into `~/.judytinrc`, to have
+it everywhere. `cargo uninstall judytin` removes the binary again. Add
+`--locked` to the install if you want exactly the dependency versions this
+was tested against, rather than the newest compatible ones.
+
+If you would rather not install anything, `cargo build --release` leaves
+the binary at `./target/release/judytin`, and `cargo run --release --`
+followed by judytin's own arguments runs it in place — that bare `--` is
+what keeps cargo from reading the flags as its own.
 
 At the judymud door, type `guest <name>` to roll a character. With
 `judymud.tin` loaded, the resume command the server gives you is captured

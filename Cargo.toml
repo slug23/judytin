@@ -5,6 +5,11 @@ edition = "2024"
 description = "A TinTin++-style MUD client: split screen, tt++ scripting, telnet, TLS or ssh"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/slug23/judytin"
+# Let-chains, so 1.88 is a real floor rather than a guess. Stated here so an
+# older toolchain says "requires rustc 1.88" instead of failing somewhere in
+# the middle of the parse with syntax it has never heard of.
+rust-version = "1.88"
 keywords = ["mud", "telnet", "tintin", "client", "terminal"]
 categories = ["command-line-utilities", "games"]
 
