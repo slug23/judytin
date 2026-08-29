@@ -405,7 +405,7 @@ pub fn connect_pipe(
     });
     // stderr (ssh banners, errors) is shown as data too, so the user sees
     // what went wrong when a key is refused
-    let help = ssh_dest.map(ssh_unknown_host_help);
+    let dest = ssh_dest.map(str::to_string);
     std::thread::spawn(move || {
         let mut r = stderr;
         let mut buf = [0u8; 8192];
@@ -414,99 +414,151 @@ pub fn connect_pipe(
             if n == 0 {
                 break;
             }
-            let matched = help.is_some() && watch.feed(&buf[..n]);
+            let note = dest.as_deref().and_then(|_| watch.feed(&buf[..n]));
             if tx.send(Ev::Net(id, buf[..n].to_vec())).is_err() {
                 break;
             }
-            // After ssh's own line, so the transcript reads as the failure
-            // followed by the explanation rather than the other way round.
-            if matched
-                && let Some(h) = &help
-                && tx.send(Ev::NetDiag(id, h.clone())).is_err()
-            {
-                break;
+            // After ssh's own line, so the transcript reads as ssh speaking and
+            // judytin explaining, rather than the other way round.
+            if let (Some(note), Some(d)) = (note, dest.as_deref()) {
+                let text = match note {
+                    SshNote::FirstContact => ssh_first_contact_note(d),
+                    SshNote::KeyChanged => ssh_key_changed_help(d),
+                };
+                if tx.send(Ev::NetDiag(id, text)).is_err() {
+                    break;
+                }
             }
         }
     });
     Ok(Conn::Pipe { stdin, child })
 }
 
-/// ssh's words when it meets a host whose key it has never seen. With
-/// BatchMode on it cannot ask, so this is where a first connection stops.
-const SSH_UNKNOWN_HOST: &str = "Host key verification failed";
+/// ssh's words when it records a host it had never seen. Trust-on-first-use
+/// happened, and the player should be told rather than left to infer it.
+const SSH_ADDED: &str = "Permanently added";
 
-/// Split `user@host:port` into the part ssh calls a destination and the port.
-fn split_dest(dest: &str) -> (&str, Option<&str>) {
+/// ssh's words when it refuses. With accept-new an unknown host is no longer
+/// a refusal, so this now means the key on offer is not the key it stored.
+const SSH_REFUSED: &str = "Host key verification failed";
+
+/// judymud's ssh door. judytin already defaults telnet to 2323 and TLS to
+/// 2324, so leaving ssh on 22 made it the one flag that needed a port typed
+/// every time — and it failed against the local sshd rather than saying so.
+/// Kept as text because everything here is command-line shaping; `:22` still
+/// reaches a real sshd.
+const DEFAULT_SSH_PORT: &str = "2322";
+
+/// Split `user@host:port` into the part ssh calls a destination and the port
+/// judytin will actually use, which is 2322 unless the destination says.
+fn split_dest(dest: &str) -> (&str, &str) {
     match dest.rsplit_once(':') {
-        Some((t, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (t, Some(p)),
-        _ => (dest, None),
+        Some((t, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (t, p),
+        _ => (dest, DEFAULT_SSH_PORT),
     }
 }
 
-/// Watches ssh's stderr for the one line judytin has something to add to.
+/// What ssh said about the host key, where judytin has something to add.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SshNote {
+    /// A host ssh had never met; its key is now recorded.
+    FirstContact,
+    /// A host ssh has met before, offering a different key than the stored one.
+    KeyChanged,
+}
+
+/// Watches ssh's stderr for the two lines judytin can improve on.
 ///
-/// Kept out of the reader thread so the awkward part is testable: the verdict
+/// Kept out of the reader thread so the awkward part is testable: a verdict
 /// can arrive split across two reads, and the buffer that stitches the halves
 /// together must not grow with a talkative child.
 struct SshWatch {
     tail: String,
-    said: bool,
+    said_added: bool,
+    said_refused: bool,
 }
 
 impl SshWatch {
-    /// Enough to hold the phrase across any seam, small enough that a child
+    /// Enough to hold either phrase across any seam, small enough that a child
     /// spraying stderr cannot make judytin hold the spray.
     const MAX: usize = 4096;
 
     fn new() -> Self {
-        Self { tail: String::new(), said: false }
+        Self { tail: String::new(), said_added: false, said_refused: false }
     }
 
-    /// True exactly once: on the chunk that completes the phrase.
-    fn feed(&mut self, chunk: &[u8]) -> bool {
-        if self.said {
-            return false;
+    /// Reports each kind of note at most once, on the chunk that completes it.
+    fn feed(&mut self, chunk: &[u8]) -> Option<SshNote> {
+        if self.said_added && self.said_refused {
+            return None;
         }
         self.tail.push_str(&String::from_utf8_lossy(chunk));
-        if self.tail.contains(SSH_UNKNOWN_HOST) {
-            self.said = true;
+        // Refusal is checked first: if both somehow appear, the refusal is the
+        // one the player needs to see.
+        if !self.said_refused && self.tail.contains(SSH_REFUSED) {
+            self.said_refused = true;
             self.tail = String::new();
-            return true;
+            return Some(SshNote::KeyChanged);
+        }
+        if !self.said_added && self.tail.contains(SSH_ADDED) {
+            self.said_added = true;
+            self.tail = String::new();
+            return Some(SshNote::FirstContact);
         }
         if self.tail.len() > Self::MAX {
             // Keep only what a phrase could still be straddling. The scan for
             // a boundary is because stderr is arbitrary bytes: from_utf8_lossy
             // gives valid UTF-8, but not one whose char edges we chose.
-            let want = self.tail.len() - SSH_UNKNOWN_HOST.len();
+            let keep = SSH_REFUSED.len().max(SSH_ADDED.len());
+            let want = self.tail.len() - keep;
             let cut = (want..=self.tail.len())
                 .find(|&i| self.tail.is_char_boundary(i))
                 .unwrap_or(self.tail.len());
             self.tail.drain(..cut);
         }
-        false
+        None
     }
 }
 
-/// What to tell a player whose first ssh connection just bounced.
-///
-/// judytin pins TLS certificates itself the first time it sees them, but ssh
-/// keeps its own known_hosts and we run it with BatchMode on — there is no
-/// terminal behind the pipe, so a trust prompt would hang where nobody could
-/// answer it. The decision therefore stays with ssh, and has to be made once,
-/// deliberately, outside judytin. Saying so is the whole point: ssh's one
-/// line reads like judytin failing to connect, and it is not.
-pub fn ssh_unknown_host_help(dest: &str) -> String {
+/// Host and port in the shape ssh-keygen and known_hosts use.
+fn host_entry(dest: &str) -> String {
     let (target, port) = split_dest(dest);
     let host = target.rsplit_once('@').map_or(target, |(_, h)| h);
-    let port_arg = port.map(|p| format!("-p {} ", p)).unwrap_or_default();
+    // Always bracketed-with-port, because judytin always passes -p: that is
+    // the form ssh writes into known_hosts, and so the form `ssh-keygen -R`
+    // has to be given back. Naming the bare host here would hand the player a
+    // remedy that silently removes nothing.
+    format!("[{}]:{}", host, port)
+}
+
+/// Said once, the first time judytin reaches a host through ssh.
+///
+/// judytin pins a TLS certificate on first sight and says so; this is the same
+/// bargain and deserves the same sentence. Silence would be worse: the player
+/// would never learn that the moment their trust was decided had passed.
+fn ssh_first_contact_note(dest: &str) -> String {
     format!(
-        "that is ssh refusing a host it has no key for, not judytin failing \
-         to reach it. judytin runs ssh with BatchMode on, so ssh cannot stop \
-         to ask whether you trust this server. Check the key against what the \
-         server's owner published, and if it matches, tell ssh once: \
-         ssh-keyscan {}{} >> ~/.ssh/known_hosts",
-        port_arg,
-        shell_quote(host),
+        "first ssh connection to {} — its key was unknown, so ssh has recorded \
+         it in ~/.ssh/known_hosts. That first key is taken on faith, exactly as \
+         judytin pins a TLS certificate on first sight; from here on a changed \
+         key is refused.",
+        host_entry(dest)
+    )
+}
+
+/// Said when ssh refuses. With accept-new in the command line, an unfamiliar
+/// host is recorded rather than refused — so a refusal means the key changed,
+/// and the remedy is emphatically NOT to append a new one.
+fn ssh_key_changed_help(dest: &str) -> String {
+    let entry = host_entry(dest);
+    format!(
+        "ssh refused {}: the key it offered is not the key stored in \
+         ~/.ssh/known_hosts. Either the server was rebuilt, or something is \
+         standing between you and it — and nothing judytin can see tells the \
+         two apart. Do not append the new key to make this go away. Ask whoever \
+         runs the server what its key should be, and only if it checks out drop \
+         the old line with:  ssh-keygen -R {}",
+        entry, entry
     )
 }
 
@@ -514,13 +566,19 @@ pub fn ssh_unknown_host_help(dest: &str) -> String {
 /// destination becomes `-p port`.
 pub fn ssh_command(dest: &str) -> String {
     let (target, port) = split_dest(dest);
-    let port_arg = port.map(|p| format!("-p {} ", p)).unwrap_or_default();
     // `--` so a destination beginning with '-' is a destination and not an
     // option: without it, `--ssh -oProxyCommand=...` would be handed to ssh
     // as configuration rather than a host to reach.
+    // accept-new records a host we have never met and keeps refusing one whose
+    // key has changed. That is trust-on-first-use — the same bargain judytin
+    // already strikes with TLS certificates, and the same one plain ssh offers
+    // interactively. BatchMode stays: it is what stops a password prompt from
+    // hanging behind a pipe, and with accept-new it no longer suppresses the
+    // one question that mattered.
     format!(
-        "ssh -T -o BatchMode=yes -o ServerAliveInterval=30 {}-- {}",
-        port_arg,
+        "ssh -T -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+         -o ServerAliveInterval=30 -p {} -- {}",
+        port,
         shell_quote(target)
     )
 }
@@ -548,63 +606,96 @@ mod tests {
 
     #[test]
     fn ssh_command_quotes_and_ports() {
+        const OPTS: &str =
+            "-T -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30";
+        // No port typed means judymud's door, not ssh's.
         assert_eq!(
             ssh_command("play@mud.example.org"),
-            "ssh -T -o BatchMode=yes -o ServerAliveInterval=30 -- play@mud.example.org"
+            format!("ssh {OPTS} -p 2322 -- play@mud.example.org")
         );
         assert_eq!(
             ssh_command("grib@127.0.0.1:2322"),
-            "ssh -T -o BatchMode=yes -o ServerAliveInterval=30 -p 2322 -- grib@127.0.0.1"
+            format!("ssh {OPTS} -p 2322 -- grib@127.0.0.1")
+        );
+        // A real sshd is still reachable by saying so.
+        assert_eq!(
+            ssh_command("me@shell.example.org:22"),
+            format!("ssh {OPTS} -p 22 -- me@shell.example.org")
         );
         assert!(ssh_command("a b").ends_with("'a b'"));
     }
 
     #[test]
-    fn unknown_host_help_names_the_port_and_the_host() {
-        let h = ssh_unknown_host_help("grib@mud.example.org:2322");
+    fn command_records_an_unseen_host_but_still_refuses_a_changed_one() {
+        let c = ssh_command("grib@localhost:2322");
         assert!(
-            h.contains("ssh-keyscan -p 2322 mud.example.org >> ~/.ssh/known_hosts"),
-            "no usable remedy: {h}"
+            c.contains("-o StrictHostKeyChecking=accept-new"),
+            "first contact would still dead-end: {c}"
         );
-        // The user part is ssh's business, not keyscan's.
-        assert!(!h.contains("grib@"), "leaked the username into keyscan: {h}");
-        // Default port stays implicit, as ssh-keyscan expects.
-        let d = ssh_unknown_host_help("play@mud.example.org");
-        assert!(d.contains("ssh-keyscan mud.example.org >>"), "{d}");
-        // A hostile destination cannot smuggle shell into copy-pasteable advice.
-        let q = ssh_unknown_host_help("me@evil; rm -rf ~");
-        assert!(q.contains("'evil; rm -rf ~'"), "advice not quoted: {q}");
+        assert!(c.contains("-o BatchMode=yes"), "a prompt could hang behind the pipe: {c}");
     }
 
     #[test]
-    fn watch_fires_once_even_when_split_across_reads() {
+    fn the_two_notes_say_opposite_things_about_appending_a_key() {
+        let first = ssh_first_contact_note("grib@localhost:2322");
+        assert!(first.contains("[localhost]:2322"), "{first}");
+        assert!(first.contains("taken on faith"), "does not admit what it cost: {first}");
+
+        let changed = ssh_key_changed_help("grib@localhost:2322");
+        assert!(
+            changed.contains("ssh-keygen -R [localhost]:2322"),
+            "no way forward: {changed}"
+        );
+        // The dangerous advice for this case is "append the new key". A message
+        // that tells someone to keyscan a CHANGED key talks them through the
+        // exact motion an interceptor needs from them.
+        assert!(
+            !changed.contains("ssh-keyscan"),
+            "advises appending a changed key: {changed}"
+        );
+        assert!(changed.contains("Do not append"), "{changed}");
+    }
+
+    #[test]
+    fn host_entry_drops_the_user_and_carries_the_effective_port() {
+        assert_eq!(host_entry("grib@mud.example.org:2322"), "[mud.example.org]:2322");
+        // The advice must name the entry ssh actually wrote. judytin always
+        // passes -p, so the default port belongs in the entry too — say
+        // "mud.example.org" here and `ssh-keygen -R` would remove nothing.
+        assert_eq!(host_entry("grib@mud.example.org"), "[mud.example.org]:2322");
+        assert_eq!(host_entry("mud.example.org"), "[mud.example.org]:2322");
+        assert_eq!(host_entry("me@shell.example.org:22"), "[shell.example.org]:22");
+    }
+
+    #[test]
+    fn watch_tells_the_two_verdicts_apart_across_a_seam() {
         let mut w = SshWatch::new();
-        assert!(!w.feed(b"ssh: Host key verifi"));
-        assert!(w.feed(b"cation failed.\r\n"), "missed the seam");
-        // Only ever once: the advice is not repeated for every later byte.
-        assert!(!w.feed(b"Host key verification failed.\r\n"));
+        assert_eq!(w.feed(b"Warning: Permanently ad"), None);
+        assert_eq!(w.feed(b"ded '[localhost]:2322'"), Some(SshNote::FirstContact));
+        // Said once.
+        assert_eq!(w.feed(b"Permanently added again"), None);
+        // A refusal is still reported after a first-contact note.
+        assert_eq!(w.feed(b"Host key verification failed."), Some(SshNote::KeyChanged));
+        assert_eq!(w.feed(b"Host key verification failed."), None);
     }
 
     #[test]
     fn watch_does_not_grow_with_a_talkative_child() {
         let mut w = SshWatch::new();
         for _ in 0..64 {
-            assert!(!w.feed(&[b'x'; 4096]));
+            assert_eq!(w.feed(&[b'x'; 4096]), None);
         }
         assert!(w.tail.len() <= SshWatch::MAX + 4096, "buffer ran away: {}", w.tail.len());
-        // Still watching, and still able to match after the trimming.
-        assert!(w.feed(b"Host key verification failed."));
+        assert_eq!(w.feed(b"Host key verification failed."), Some(SshNote::KeyChanged));
     }
 
     #[test]
     fn watch_survives_a_multibyte_boundary_in_the_trim() {
         let mut w = SshWatch::new();
-        // A wall of multibyte characters means the trim point almost never
-        // lands on a char boundary by luck.
         for _ in 0..64 {
-            assert!(!w.feed("é".repeat(2048).as_bytes()));
+            assert_eq!(w.feed("é".repeat(2048).as_bytes()), None);
         }
-        assert!(w.feed(b"Host key verification failed."));
+        assert_eq!(w.feed(b"Permanently added"), Some(SshNote::FirstContact));
     }
 
     #[test]

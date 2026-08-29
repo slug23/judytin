@@ -58,7 +58,8 @@ fn parse_args() -> Result<Args, String> {
                      \x20 --tls           connect with TLS (defaults to port 2324; the\n\
                      \x20                 server cert is pinned in ~/.judytin_known_hosts)\n\
                      \x20 --ssh <dest>    connect through the system ssh, e.g.\n\
-                     \x20                 --ssh grib@mudhost:2322 — your key is your character\n\
+                     \x20                 --ssh grib@mudhost (port 2322 unless you say\n\
+                     \x20                 otherwise) — your ssh key is your character\n\
                      \x20 --dumb          plain line mode, no split screen (auto when piped)\n\
                      \x20 --offline       don't connect at startup; use #session later\n\
                      \x20 -h, --help      this text\n\

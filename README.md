@@ -25,7 +25,7 @@ judytin                            # connects to 127.0.0.1:2323 (judymud)
 judytin -r judymud.tin             # starter script (from the clone directory)
 judytin some.mud.org 4000
 judytin --tls mudhost              # telnet-over-TLS (port 2324)
-judytin --ssh grib@mudhost:2322    # your ssh key is your character
+judytin --ssh slug@mudhost         # ssh door (2322); your key is your character
 ```
 
 `judymud.tin` stays in the clone, so `-r judymud.tin` finds it only from
@@ -132,16 +132,20 @@ Three ways to reach a MUD, indistinguishable above the socket:
   *is* the identity: an unknown key rolls a guest character, the same key
   resumes it — no resume key to keep.
 
-  One wrinkle worth knowing before it bites you: judytin runs ssh with
+  The port defaults to 2322, judymud's ssh door, the same way the bare
+  command defaults to 2323 and `--tls` to 2324; `--ssh me@host:22` still
+  reaches an ordinary sshd.
+
+  Trust works the way it does for TLS. judytin runs ssh with
   `BatchMode=yes`, because there is no terminal behind the pipe and a
-  prompt would hang where nobody could answer it. That includes ssh's
-  *first* prompt, the one asking whether you trust a new server — so the
-  first `--ssh` to a host you have never met stops at `Host key
-  verification failed`. judytin says as much when it happens, and names the
-  cure: check the key against what the server's owner published, then
-  `ssh-keyscan -p 2322 host >> ~/.ssh/known_hosts` once. Unlike TLS, where
-  judytin pins on first sight, this trust decision stays with ssh and stays
-  deliberate.
+  prompt would hang where nobody could answer it; `accept-new` alongside it
+  means a host ssh has never met is recorded rather than refused, so a
+  first `--ssh` simply connects. judytin says so when that happens — the
+  first key is taken on faith and you should know the moment it was. A host
+  whose key later *changes* is still refused, and judytin says something
+  quite different there: it cannot tell a rebuilt server from someone
+  standing in the middle, and appending the new key is the one thing not to
+  do.
 
 ## What it does under the hood
 
