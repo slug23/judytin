@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Spawn a line-echo mock MUD on an ephemeral port. Replies "you said: X"
 /// to each line; closes on "quit".
@@ -344,6 +345,22 @@ fn dumb_mode_against_mock_mud() {
                     }
                     if text == "quit" {
                         sock.write_all(b"Goodbye.\r\n").unwrap();
+                        // Drain before hanging up. judytin answers the telnet
+                        // offer from its event loop, and when stdin is a pipe it
+                        // can flush all four typed lines before it reaches the
+                        // queued network read — so the refusal legitimately
+                        // arrives just after `quit`. The assertion below is about
+                        // the whole session, not about which of the two won a
+                        // startup race, and slamming the socket shut here is what
+                        // made this test fail at random.
+                        let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
+                        let mut sink = [0u8; 1024];
+                        while let Ok(n) = sock.read(&mut sink) {
+                            if n == 0 {
+                                break;
+                            }
+                            received_srv.lock().unwrap().extend_from_slice(&sink[..n]);
+                        }
                         break 'outer;
                     }
                     sock.write_all(b"> ").unwrap();
