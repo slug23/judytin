@@ -183,6 +183,16 @@ Known and accepted: `#system` and `#run` execute shell commands *you* type,
 file — so only load scripts you would run as programs. Trigger patterns
 themselves are user-authored and trusted.
 
+**judytin is not a privileged client.** It was built alongside judymud, but
+it holds no shared secret, speaks no private protocol, and can do nothing
+that any other client cannot. judymud performs no client identification at
+all — it does not know judytin from `nc` — and the only judymud-specific
+things here are default port numbers and a starter script assembled from
+output every client can see. Anything judytin ever needs from the server
+goes into judymud's public protocol first, so every client gets it at the
+same time. A client with special powers is a credential worth stealing;
+there is deliberately nothing here to steal.
+
 Found something? Please open an issue.
 
 ## Development

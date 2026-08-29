@@ -1,1 +1,6 @@
 /target
+
+# Local working files: session logs, #write dumps, captured play.
+# Keep anything from a real game session out of a public repo.
+*.local.tin
+.judytinrc
