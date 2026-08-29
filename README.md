@@ -195,3 +195,18 @@ cargo test    # unit tests, end-to-end tests, and tests/security.rs —
 `tests/security.rs` is the interesting one: every test in it is a server
 trying to execute code, crash the client, or steer a script, and several
 are regressions for bugs that were live.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
+
+judytin is an independent implementation of the TinTin++ command language,
+written from its published manual. It shares no code with
+[TinTin++](https://tintin.mudhalla.net/), which is GPL-3 and the work of
+other people entirely.

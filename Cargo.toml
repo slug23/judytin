@@ -2,6 +2,11 @@
 name = "judytin"
 version = "0.1.0"
 edition = "2024"
+description = "A TinTin++-style MUD client: split screen, tt++ scripting, telnet, TLS or ssh"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["mud", "telnet", "tintin", "client", "terminal"]
+categories = ["command-line-utilities", "games"]
 
 [dependencies]
 crossterm = "0.29.0"
