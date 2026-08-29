@@ -1,0 +1,17 @@
+#nop ── judytin starter script for judymud ──────────────────────────────
+#nop run with:  judytin -r judymud.tin      (#nop lines are comments)
+
+#config speedwalk on
+
+#nop when the server hands you a resume command, keep it in $resume
+#action {`resume %1 %2`} {#variable {resume} {resume %1 %2};#showme {judytin: resume command saved — type rk to see it, res to use it}}
+
+#nop rk shows the saved resume command and res sends it after a reconnect
+#alias {rk} {#showme {$resume}}
+#alias {res} {$resume}
+
+#nop quick guest login: g <name> [warrior|mage|cleric|thief]
+#alias {g} {guest %0}
+
+#nop make the resume-key line hard to miss
+#highlight {resume key} {light red}
