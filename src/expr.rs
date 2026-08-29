@@ -93,14 +93,23 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
                 chars.next();
                 toks.push(Tok::RParen);
             }
+            // Quoted strings take an escaped character literally, so data
+            // that reaches an expression cannot close its own quote and
+            // inject operators — `#if {"$mob" == "dragon"}` stays one
+            // comparison however hostile $mob is.
             '"' => {
                 chars.next();
                 let mut s = String::new();
-                for n in chars.by_ref() {
-                    if n == '"' {
-                        break;
+                while let Some(n) = chars.next() {
+                    match n {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(escaped) = chars.next() {
+                                s.push(escaped);
+                            }
+                        }
+                        _ => s.push(n),
                     }
-                    s.push(n);
                 }
                 toks.push(Tok::Str(s));
             }
@@ -108,8 +117,14 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
                 chars.next();
                 let mut s = String::new();
                 let mut depth = 1;
-                for n in chars.by_ref() {
+                while let Some(n) = chars.next() {
                     match n {
+                        '\\' => {
+                            if let Some(escaped) = chars.next() {
+                                s.push(escaped);
+                            }
+                            continue;
+                        }
                         '{' => depth += 1,
                         '}' => {
                             depth -= 1;
@@ -232,7 +247,18 @@ struct Parser<'a> {
     toks: &'a [Tok],
     pos: usize,
     rng: u64,
+    /// Nesting depth, to keep a deeply parenthesised expression from
+    /// overflowing the stack. A server can steer this: it feeds a variable
+    /// that a script later evaluates, and a stack overflow aborts the
+    /// process without unwinding — which would leave the terminal in raw
+    /// mode with the scroll region set.
+    depth: u32,
 }
+
+/// Deep enough for any expression a person writes; shallow enough that the
+/// recursive descent (13 precedence levels per nesting level) stays far
+/// inside the stack.
+const MAX_EXPR_DEPTH: u32 = 64;
 
 pub fn eval(input: &str) -> Result<Value, String> {
     let toks = tokenize(input)?;
@@ -244,7 +270,7 @@ pub fn eval(input: &str) -> Result<Value, String> {
         .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
         .unwrap_or(0x9e3779b9)
         | 1;
-    let mut p = Parser { toks: &toks, pos: 0, rng: seed };
+    let mut p = Parser { toks: &toks, pos: 0, rng: seed, depth: 0 };
     let v = p.ternary()?;
     if p.pos != p.toks.len() {
         return Err("trailing junk in expression".into());
@@ -346,7 +372,12 @@ impl<'a> Parser<'a> {
             }
             Some(Tok::LParen) => {
                 self.pos += 1;
+                self.depth += 1;
+                if self.depth > MAX_EXPR_DEPTH {
+                    return Err("expression nested too deeply".into());
+                }
                 let v = self.ternary()?;
+                self.depth -= 1;
                 if self.toks.get(self.pos) != Some(&Tok::RParen) {
                     return Err("missing ')'".into());
                 }

@@ -15,6 +15,15 @@ use crate::ui::SplitUi;
 
 pub const MAX_DEPTH: u32 = 64;
 
+/// Longest line we will accumulate before forcing it out for display.
+///
+/// Two hostile shapes need this: a server that never sends a newline (the
+/// buffer would grow until the client is killed), and one that sends a very
+/// long line (trigger matching costs more than linear in the line length,
+/// so a single huge line freezes the single-threaded event loop). No real
+/// MUD line approaches this.
+pub const MAX_LINE: usize = 8 * 1024;
+
 #[allow(clippy::large_enum_variant)]
 pub enum Ev {
     Key(crossterm::event::KeyEvent),
@@ -44,6 +53,10 @@ pub struct Timed {
     pub body: String,
     pub interval: Duration,
     pub next: Instant,
+    /// Set when the timer was created by server-driven execution, so its
+    /// body inherits that restriction when it eventually fires rather than
+    /// laundering it through the clock.
+    pub server_driven: bool,
 }
 
 pub struct Trigger {
@@ -80,6 +93,13 @@ pub struct App {
     pub(crate) gag_next: u32,
     pub(crate) speedwalk_on: bool,
     pub(crate) echo_on: bool,
+    /// Nesting depth of server-caused execution (triggers, events). Above
+    /// zero, commands that touch the machine are refused.
+    pub(crate) server_driven: u32,
+    /// Operator override: let server-driven triggers run shell and file
+    /// commands anyway. Off by default, and saying yes is a real decision —
+    /// it hands a hostile MUD the keys.
+    pub(crate) trigger_shell: bool,
     pub(crate) verbatim_on: bool,
     pub(crate) repeat_char: char,
     pub(crate) packet_patch: Duration,
@@ -95,6 +115,10 @@ pub struct App {
     telnet: Telnet,
     line_buf: String,
     line_written: usize,
+    /// Bytes not yet forming a whole UTF-8 character, held across packets.
+    byte_buf: Vec<u8>,
+    /// An escape sequence that arrived only partly, held until it finishes.
+    esc_buf: String,
     flush_deadline: Option<Instant>,
 }
 
@@ -150,6 +174,8 @@ impl App {
             gag_next: 0,
             speedwalk_on: false,
             echo_on: true,
+            server_driven: 0,
+            trigger_shell: false,
             verbatim_on: false,
             repeat_char: '!',
             packet_patch: Duration::from_millis(30),
@@ -165,6 +191,8 @@ impl App {
             telnet: Telnet::new(),
             line_buf: String::new(),
             line_written: 0,
+            byte_buf: Vec::new(),
+            esc_buf: String::new(),
             flush_deadline: None,
         }
     }
@@ -332,14 +360,19 @@ impl App {
             return String::new();
         };
         let args = self.subst(args_raw, depth);
-        let mut caps: Vec<(u8, String)> = args
-            .split(';')
+        // Split on unescaped separators only: an escaped `;` inside an
+        // argument is data and must not become an argument boundary.
+        let mut caps: Vec<(u8, String)> = script::split_unescaped(&args, ';')
+            .into_iter()
             .filter(|a| !a.is_empty())
             .enumerate()
             .take(99)
-            .map(|(i, a)| ((i + 1) as u8, a.to_string()))
+            .map(|(i, a)| ((i + 1) as u8, a))
             .collect();
         caps.push((0, args.clone()));
+        // The function body is user-authored but the arguments may carry
+        // server data, and the result is parsed again — so the arguments
+        // keep whatever escaping they arrived with.
         let expanded = pattern::expand(&body, &caps, &args);
         let saved_ret = self.return_val.take();
         self.locals.push(BTreeMap::new());
@@ -361,6 +394,25 @@ impl App {
         self.locals.push(BTreeMap::new());
         let _ = self.run_input(body, depth);
         self.locals.pop();
+    }
+
+    /// Run a body that the server caused to run — a trigger or an event.
+    ///
+    /// The second layer of defence. Escaping (see [`crate::data`]) already
+    /// stops server text from becoming commands; this marks the execution
+    /// itself so that commands with effects outside the game — shell,
+    /// subprocess, filesystem — refuse to run, however they were reached.
+    /// If a parser bug ever lets data escape, the blast radius is the MUD
+    /// session, not the machine.
+    pub fn run_server_body(&mut self, body: &str, depth: u32) {
+        self.server_driven += 1;
+        self.run_body(body, depth);
+        self.server_driven -= 1;
+    }
+
+    /// May a command with effects outside the game run right now?
+    pub fn local_effects_allowed(&self) -> bool {
+        self.server_driven == 0 || self.trigger_shell
     }
 
     // ---- networking -----------------------------------------------------
@@ -468,7 +520,10 @@ impl App {
         }
     }
 
+    /// Send one line to the MUD. A sink: escaped data becomes plain text
+    /// here, on its way out of the client's grammar for good.
     pub fn send_line(&mut self, line: &str) {
+        let line = &crate::data::unescape(line);
         if self.conn.is_none() {
             self.info(&format!("not connected — cannot send '{}'. try #session", line));
             return;
@@ -496,8 +551,10 @@ impl App {
             .map(|(i, a)| (i as u8, a.clone()))
             .collect();
         let all = args.first().cloned().unwrap_or_default();
-        let expanded = pattern::expand(&body, &caps, &all);
-        self.run_body(&expanded, 1);
+        // Event arguments are raw server text (RECEIVED LINE hands over the
+        // whole line), so they cross the same boundary as trigger captures.
+        let expanded = pattern::expand_data(&body, &caps, &all);
+        self.run_server_body(&expanded, 1);
     }
 
     // ---- event dispatch -------------------------------------------------
@@ -625,19 +682,23 @@ impl App {
             self.flush_partial();
         }
         let now = Instant::now();
-        let due: Vec<(String, String)> = self
+        let due: Vec<(String, String, bool)> = self
             .tickers
             .iter()
             .filter(|(_, t)| t.next <= now)
-            .map(|(k, t)| (k.clone(), t.body.clone()))
+            .map(|(k, t)| (k.clone(), t.body.clone(), t.server_driven))
             .collect();
-        for (name, body) in due {
+        for (name, body, from_server) in due {
             if let Some(t) = self.tickers.get_mut(&name) {
                 while t.next <= now {
                     t.next += t.interval;
                 }
             }
-            self.run_body(&body, 1);
+            if from_server {
+                self.run_server_body(&body, 1);
+            } else {
+                self.run_body(&body, 1);
+            }
         }
         let due: Vec<String> = self
             .delays
@@ -647,7 +708,11 @@ impl App {
             .collect();
         for name in due {
             if let Some(t) = self.delays.remove(&name) {
-                self.run_body(&t.body, 1);
+                if t.server_driven {
+                    self.run_server_body(&t.body, 1);
+                } else {
+                    self.run_body(&t.body, 1);
+                }
             }
         }
     }
@@ -662,12 +727,55 @@ impl App {
         if let Ui::Split(ui) = &mut self.ui {
             ui.masked = self.telnet.server_echo;
         }
-        let text = String::from_utf8_lossy(&data).into_owned();
+        // Decode across packet boundaries, not per packet: a multi-byte
+        // character split by TCP would otherwise arrive as two replacement
+        // characters.
+        self.byte_buf.extend_from_slice(&data);
+        let text = match std::str::from_utf8(&self.byte_buf) {
+            Ok(text) => {
+                let text = text.to_string();
+                self.byte_buf.clear();
+                text
+            }
+            Err(error) => {
+                let good = error.valid_up_to();
+                let text = String::from_utf8_lossy(&self.byte_buf[..good]).into_owned();
+                // Keep only a genuine partial tail; anything longer is
+                // malformed and would grow without bound.
+                let tail = self.byte_buf.split_off(good);
+                self.byte_buf = if tail.len() <= 4 { tail } else { Vec::new() };
+                text
+            }
+        };
+        // Filter before anything downstream sees it: the terminal is an
+        // interpreter too, and only colour belongs to the server. An escape
+        // sequence split across packets is rejoined here rather than being
+        // half-filtered — with a cap, so a sequence that never ends cannot
+        // become a second unbounded buffer.
+        let text = if self.esc_buf.is_empty() {
+            text
+        } else {
+            format!("{}{}", std::mem::take(&mut self.esc_buf), text)
+        };
+        let (text, incomplete) = crate::ansi::sanitize(&text);
+        self.esc_buf = if incomplete.len() <= 256 {
+            incomplete
+        } else {
+            String::new()
+        };
         for c in text.chars() {
             match c {
                 '\n' => self.complete_line(),
                 '\r' => {}
-                _ => self.line_buf.push(c),
+                _ => {
+                    self.line_buf.push(c);
+                    // A server that never sends a newline must not be able
+                    // to grow this without limit, nor hand the pattern
+                    // matcher a line long enough to freeze the client.
+                    if self.line_buf.len() >= MAX_LINE {
+                        self.complete_line();
+                    }
+                }
             }
         }
         // Unterminated tail (usually the prompt): hold it briefly so a reply
@@ -699,12 +807,14 @@ impl App {
         let written = std::mem::take(&mut self.line_written);
         let (plain, _) = strip_map(&raw);
 
-        // collect matching action bodies (and count down multishots)
+        // Collect matching action bodies (and count down multishots).
+        // expand_data, not expand: these captures are server text, and this
+        // is the boundary where they must stop being able to become code.
         let mut to_run: Vec<String> = Vec::new();
         let mut spent: Vec<String> = Vec::new();
         for (pat, trig) in &self.actions {
             if let Some(caps) = pattern::matches(pat, &plain) {
-                to_run.push(pattern::expand(&trig.body, &caps, &plain));
+                to_run.push(pattern::expand_data(&trig.body, &caps, &plain));
                 if trig.shots.is_some() {
                     spent.push(pat.clone());
                 }
@@ -748,7 +858,7 @@ impl App {
         }
 
         for body in to_run {
-            self.run_body(&body, 1);
+            self.run_server_body(&body, 1);
         }
         self.fire_event("RECEIVED LINE", &[raw, plain]);
     }
@@ -764,6 +874,7 @@ impl App {
                     break;
                 }
                 let (plain, map) = strip_map(&raw);
+                search_from = ceil_boundary(&plain, search_from);
                 if search_from >= plain.len() {
                     break;
                 }
@@ -799,6 +910,7 @@ impl App {
                     break;
                 }
                 let (plain, map) = strip_map(&raw);
+                search_from = ceil_boundary(&plain, search_from);
                 if search_from >= plain.len() {
                     break;
                 }
@@ -846,7 +958,9 @@ impl App {
             self.line_buf.clear();
             self.line_written = 0;
         }
-        if matches!(self.ui, Ui::Dumb) {
+        if matches!(self.ui, Ui::Dumb) && !self.telnet.server_echo {
+            // Not while the server has taken ECHO: that is a password
+            // prompt, and this echo would put it on screen and in the log.
             let mut msg = String::from("\x1b[2m>> ");
             msg.push_str(line);
             msg.push_str("\x1b[0m\r\n");
@@ -940,6 +1054,20 @@ fn next_char(s: &str, i: usize) -> usize {
         j += 1;
     }
     j
+}
+
+/// Round a byte offset up to the next character boundary.
+///
+/// The scan loops advance past a match by a byte or by a replacement's
+/// length, either of which can land inside a multi-byte character — and
+/// slicing there panics. Server text is full of multi-byte characters (an
+/// em-dash is enough), so this is a crash, not a curiosity.
+fn ceil_boundary(s: &str, i: usize) -> usize {
+    let mut i = i;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 /// Normalize a key event into a macro name like "f5", "ctrl-t", "alt-x".

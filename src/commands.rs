@@ -84,7 +84,8 @@ impl App {
                 self.send_line(&text);
             }
             "showme" => {
-                let text = self.subst(&get_tail(rest), depth);
+                // A sink: what reaches the screen is text, not script.
+                let text = crate::data::unescape(&self.subst(&get_tail(rest), depth));
                 self.output(&format!("{}{}\r\n", text, RESET));
             }
             "echo" => return self.cmd_echo(rest, depth),
@@ -272,6 +273,9 @@ impl App {
     // ---- flow control ---------------------------------------------------
 
     fn eval_cond(&mut self, cond: &str, depth: u32) -> bool {
+        // Escapes are deliberately NOT resolved here: the expression
+        // tokenizer understands them, so data stays inside its quotes
+        // instead of being able to close them and inject operators.
         let text = self.subst(cond, depth);
         match expr::eval(&text) {
             Ok(v) => v.truthy(),
@@ -337,7 +341,9 @@ impl App {
 
     fn eval_value(&mut self, text: &str, depth: u32) -> Value {
         let text = self.subst(text, depth);
-        expr::eval(&text).unwrap_or(Value::Str(text))
+        // The tokenizer resolves escapes inside strings; the fallback path
+        // never reached one, so it resolves them itself.
+        expr::eval(&text).unwrap_or_else(|_| Value::Str(crate::data::unescape(&text)))
     }
 
     fn cmd_switch(&mut self, rest: &str, depth: u32) -> Flow {
@@ -803,9 +809,12 @@ impl App {
             }
         };
         let interval = Duration::from_secs_f64(secs);
+        // A timer created by a trigger stays server-driven when it fires;
+        // otherwise the clock would launder the restriction away.
+        let server_driven = !self.local_effects_allowed();
         self.tickers.insert(
             name.clone(),
-            Timed { body, interval, next: Instant::now() + interval },
+            Timed { body, interval, next: Instant::now() + interval, server_driven },
         );
         self.tag_class("ticker", &name);
         self.info_kind("ticker", &format!("ok. ticker {{{}}} fires every {}s", name, secs));
@@ -843,12 +852,14 @@ impl App {
                 return;
             }
         };
+        let server_driven = !self.local_effects_allowed();
         self.delays.insert(
             name.clone(),
             Timed {
                 body,
                 interval: Duration::from_secs_f64(secs),
                 next: Instant::now() + Duration::from_secs_f64(secs),
+                server_driven,
             },
         );
         self.info_kind("delay", &format!("ok. delay {{{}}} fires in {}s", name, secs));
@@ -910,7 +921,7 @@ impl App {
                 if arg.is_empty() {
                     self.info("usage: #class {name} {write} {file}");
                 } else {
-                    match std::fs::write(&arg, out) {
+                    match write_private(&arg, out.as_bytes()) {
                         Ok(_) => self.info(&format!("class {{{}}} written to {}", name, arg)),
                         Err(e) => self.info(&format!("cannot write {}: {}", arg, e)),
                     }
@@ -1129,20 +1140,30 @@ impl App {
     }
 
     fn cmd_log(&mut self, rest: &str) {
+        if !self.guard_local_effects("#log") {
+            return;
+        }
         let (op, r2) = get_arg(rest);
-        let file = get_tail(r2);
+        let file = crate::data::unescape(&get_tail(r2));
         match op.to_lowercase().as_str() {
             "append" | "overwrite" => {
                 if file.is_empty() {
                     self.info("usage: #log {append|overwrite|off} {file}");
                     return;
                 }
-                let f = std::fs::OpenOptions::new()
-                    .create(true)
+                // 0600: a session log holds whatever the mud told you,
+                // which on many muds includes your own password prompt.
+                let mut opts = std::fs::OpenOptions::new();
+                opts.create(true)
                     .append(op.eq_ignore_ascii_case("append"))
                     .write(true)
-                    .truncate(op.eq_ignore_ascii_case("overwrite"))
-                    .open(&file);
+                    .truncate(op.eq_ignore_ascii_case("overwrite"));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                let f = opts.open(&file);
                 match f {
                     Ok(f) => {
                         self.log_file = Some(f);
@@ -1391,6 +1412,7 @@ impl App {
                                 body: format!("#send {{{}}}", step),
                                 interval: after,
                                 next: Instant::now() + after,
+                                server_driven: !self.local_effects_allowed(),
                             },
                         );
                     }
@@ -1532,14 +1554,34 @@ impl App {
     }
 
     fn cmd_run(&mut self, rest: &str, depth: u32) {
+        if !self.guard_local_effects("#run") {
+            return;
+        }
         let (name, r2) = get_arg(rest);
         let command = get_tail(r2);
         if name.is_empty() || command.is_empty() {
             self.info("usage: #run {name} {shell command} — e.g. #run {mud} {ssh -T play@host}");
             return;
         }
-        let command = self.subst(&command, depth);
-        self.connect_pipe(&name, &command);
+        let command = crate::data::unescape(&self.subst(&command, depth));
+        self.connect_pipe(&crate::data::unescape(&name), &command);
+    }
+
+    /// Refuse commands with effects outside the game when the server caused
+    /// this execution. The message names the escape hatch rather than just
+    /// saying no, because a player with a legitimate trigger needs to know
+    /// the choice exists — and what it costs.
+    fn guard_local_effects(&mut self, what: &str) -> bool {
+        if self.local_effects_allowed() {
+            return true;
+        }
+        self.info(&format!(
+            "{} refused: this was run by a trigger, and the mud can influence that. \
+             `#config {{trigger shell}} on` allows it — only for muds you trust with \
+             your machine.",
+            what
+        ));
+        false
     }
 
     fn cmd_config(&mut self, rest: &str) {
@@ -1570,6 +1612,17 @@ impl App {
                 self.verbatim_on = on;
                 self.info(&format!("ok. verbatim is {}", onoff(on)));
             }
+            "trigger shell" => {
+                self.trigger_shell = on;
+                if on {
+                    self.info(
+                        "ok. triggers may now run #system, #run and file commands — \
+                         a hostile mud can reach these. off is the safe setting.",
+                    );
+                } else {
+                    self.info("ok. triggers may not run shell or file commands");
+                }
+            }
             "repeat char" => {
                 if let Some(c) = val.chars().next() {
                     self.repeat_char = c;
@@ -1596,7 +1649,10 @@ impl App {
     }
 
     pub fn cmd_read(&mut self, rest: &str, depth: u32) {
-        let path = get_tail(rest);
+        if !self.guard_local_effects("#read") {
+            return;
+        }
+        let path = crate::data::unescape(&get_tail(rest));
         if path.is_empty() {
             self.info("usage: #read {file}");
             return;
@@ -1619,7 +1675,10 @@ impl App {
     }
 
     fn cmd_write(&mut self, rest: &str) {
-        let path = get_tail(rest);
+        if !self.guard_local_effects("#write") {
+            return;
+        }
+        let path = crate::data::unescape(&get_tail(rest));
         if path.is_empty() {
             self.info("usage: #write {file}");
             return;
@@ -1673,14 +1732,19 @@ impl App {
                 t.interval.as_secs_f64()
             ));
         }
-        match std::fs::write(&path, out) {
+        // 0600: a settings file carries your variables, and on this mud
+        // that includes the resume key that *is* your character.
+        match write_private(&path, out.as_bytes()) {
             Ok(_) => self.info(&format!("settings written to {}", path)),
             Err(e) => self.info(&format!("cannot write {}: {}", path, e)),
         }
     }
 
     fn cmd_textin(&mut self, rest: &str) {
-        let path = get_tail(rest);
+        if !self.guard_local_effects("#textin") {
+            return;
+        }
+        let path = crate::data::unescape(&get_tail(rest));
         if path.is_empty() {
             self.info("usage: #textin {file}");
             return;
@@ -1699,7 +1763,10 @@ impl App {
     }
 
     fn cmd_system(&mut self, rest: &str, depth: u32) {
-        let cmd = self.subst(&get_tail(rest), depth);
+        if !self.guard_local_effects("#system") {
+            return;
+        }
+        let cmd = crate::data::unescape(&self.subst(&get_tail(rest), depth));
         if cmd.is_empty() {
             self.info("usage: #system {shell command}");
             return;
@@ -1746,6 +1813,10 @@ impl App {
             #send {raw}, #cr, #textin {file}, #system {cmd}, #log {append} {f}\r
   \x1b[1mfiles\x1b[0m     #read {file}, #write {file}, ~/.judytinrc at startup\r
 \r
+  \x1b[2mserver text is data, never commands: what a trigger captures cannot\r
+  become one. shell and file commands are refused when a trigger caused\r
+  them — #config {trigger shell} on lifts that, at your own risk.\x1b[0m\r
+\r
   ctrl-d on an empty line quits, ctrl-l redraws, #commands lists everything\r
 \r
   \x1b[2mjudymud quickstart: 'guest <name>' at the door; judymud.tin saves\r
@@ -1753,6 +1824,20 @@ impl App {
 ";
         self.output(help);
     }
+}
+
+/// Write a file only the owner can read. Used for anything that may hold
+/// credentials — settings dumps and class exports both can.
+fn write_private(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(bytes)
 }
 
 fn onoff(b: bool) -> &'static str {

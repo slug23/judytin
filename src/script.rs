@@ -1,11 +1,19 @@
 //! Input parsing: the `;` command separator, `{}` argument grouping,
 //! `$variable` substitution, and speedwalk detection.
+//!
+//! Every parser here obeys rule 2 of the data discipline in [`crate::data`]:
+//! a backslash and the character after it are copied through verbatim and
+//! never interpreted. That is what stops server-derived text — escaped at
+//! the trigger boundary — from becoming syntax no matter how many layers of
+//! expansion it passes through. The backslash is removed later, once, at a
+//! sink.
 
 #[cfg(test)]
 use std::collections::BTreeMap;
 
 /// Split an input line into commands at top-level semicolons. Semicolons
-/// inside braces are kept; `\;` is a literal semicolon.
+/// inside braces belong to the group; an escaped `\;` is data and is
+/// preserved (backslash included) for the sink to resolve.
 pub fn split_commands(input: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -14,15 +22,11 @@ pub fn split_commands(input: &str) -> Vec<String> {
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
+                // Preserve the escape intact — resolving it here would let
+                // data re-enter the grammar on the next parse.
+                cur.push('\\');
                 if let Some(next) = chars.next() {
-                    if next == ';' {
-                        cur.push(';');
-                    } else {
-                        cur.push('\\');
-                        cur.push(next);
-                    }
-                } else {
-                    cur.push('\\');
+                    cur.push(next);
                 }
             }
             '{' => {
@@ -45,6 +49,28 @@ pub fn split_commands(input: &str) -> Vec<String> {
     out
 }
 
+/// Split on a separator, ignoring escaped occurrences of it. The escapes
+/// themselves are preserved for the sink.
+pub fn split_unescaped(text: &str, sep: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            cur.push('\\');
+            if let Some(next) = chars.next() {
+                cur.push(next);
+            }
+        } else if c == sep {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    out.push(cur);
+    out
+}
+
 /// Pull the next argument off `rest`: either a brace-delimited group (braces
 /// removed, nesting honored) or a whitespace-delimited word. Returns
 /// (argument, remainder).
@@ -55,8 +81,14 @@ pub fn get_arg(rest: &str) -> (String, &str) {
     }
     if let Some(stripped) = rest.strip_prefix('{') {
         let mut depth = 1usize;
-        for (i, c) in stripped.char_indices() {
+        let mut chars = stripped.char_indices();
+        while let Some((i, c)) = chars.next() {
             match c {
+                // An escaped brace is data and does not open or close a
+                // group; skip the character it protects.
+                '\\' => {
+                    chars.next();
+                }
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
@@ -90,15 +122,20 @@ pub fn get_tail(rest: &str) -> String {
     rest.to_string()
 }
 
-/// Substitute `$name` / `${name}` via `lookup`. `\$` is a literal dollar.
+/// Substitute `$name` / `${name}` via `lookup`. An escaped `\$` is data:
+/// preserved as-is, never treated as a variable reference.
 pub fn subst_vars_with(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\\' if chars.peek() == Some(&'$') => {
-                chars.next();
-                out.push('$');
+            // Preserve escapes: `\$` stays `\$` until a sink resolves it,
+            // so escaped data can never name a variable.
+            '\\' => {
+                out.push('\\');
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
             }
             '$' => {
                 let mut name = String::new();
@@ -206,8 +243,31 @@ mod tests {
     }
 
     #[test]
-    fn escaped_semicolon() {
-        assert_eq!(split_commands(r"say hi\; there"), vec!["say hi; there"]);
+    fn escaped_semicolon_does_not_split_and_stays_escaped() {
+        // The backslash survives the splitter; the sink resolves it.
+        assert_eq!(split_commands(r"say hi\; there"), vec![r"say hi\; there"]);
+    }
+
+    #[test]
+    fn escaped_braces_do_not_open_groups() {
+        // Data containing a brace must not shift argument boundaries.
+        let (a, rest) = get_arg(r"{say \} still inside} after");
+        assert_eq!(a, r"say \} still inside");
+        assert_eq!(rest.trim(), "after");
+    }
+
+    #[test]
+    fn escaped_metacharacters_survive_every_parser() {
+        // One escaped payload through the splitter, the argument reader and
+        // variable substitution: still inert at the far end.
+        let hostile = crate::data::escape("Bob;#system touch /tmp/x");
+        let line = format!("tell {hostile} hi");
+        let commands = split_commands(&line);
+        assert_eq!(commands.len(), 1, "data must not create a command");
+        let vars = BTreeMap::new();
+        let after = subst_vars(&commands[0], &vars);
+        assert!(crate::data::is_inert(&after), "leaked syntax: {after}");
+        assert!(after.contains(r"\;"), "escape was stripped: {after}");
     }
 
     #[test]
@@ -239,7 +299,11 @@ mod tests {
         vars.insert("target".to_string(), "goblin".to_string());
         assert_eq!(subst_vars("kill $target now", &vars), "kill goblin now");
         assert_eq!(subst_vars("kill ${target}s", &vars), "kill goblins");
-        assert_eq!(subst_vars(r"costs \$5 and $unknown", &vars), "costs $5 and $unknown");
+        // The escape is preserved here and resolved at the sink.
+        assert_eq!(
+            subst_vars(r"costs \$5 and $unknown", &vars),
+            r"costs \$5 and $unknown"
+        );
     }
 
     #[test]

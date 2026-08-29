@@ -178,6 +178,29 @@ pub type Match = (usize, usize, Vec<(u8, String)>);
 
 struct Ctx {
     anchored_end: bool,
+    /// Remaining match attempts. Backtracking over wildcards costs more
+    /// than linear in the line length, and the event loop is
+    /// single-threaded, so an unbounded search lets one padded line from a
+    /// hostile server freeze the client — including its ability to quit.
+    /// Running out means "no match", which is the safe answer: a trigger
+    /// that does not fire cannot do anything.
+    budget: std::cell::Cell<u64>,
+}
+
+/// Generous next to any real MUD line (a full-width line of prose costs a
+/// few thousand), small enough that the worst case stays imperceptible.
+const MATCH_BUDGET: u64 = 250_000;
+
+impl Ctx {
+    /// Charge one unit of work; false once the budget is spent.
+    fn charge(&self) -> bool {
+        let left = self.budget.get();
+        if left == 0 {
+            return false;
+        }
+        self.budget.set(left - 1);
+        true
+    }
 }
 
 /// Match `line` against the pattern. On success returns the matched span
@@ -190,11 +213,17 @@ pub fn find(pat: &Pattern, line: &str) -> Option<Match> {
         v.push(line.len());
         v
     };
-    let ctx = Ctx { anchored_end: pat.anchored_end };
+    let ctx = Ctx {
+        anchored_end: pat.anchored_end,
+        budget: std::cell::Cell::new(MATCH_BUDGET),
+    };
     for start in starts {
         let mut caps = Vec::new();
         if let Some(consumed) = match_toks(&ctx, &pat.toks, &line[start..], false, &mut caps) {
             return Some((start, start + consumed, caps));
+        }
+        if ctx.budget.get() == 0 {
+            return None; // gave up rather than hang
         }
     }
     None
@@ -260,6 +289,9 @@ fn match_toks(
                 let nchars = if last { splits.len() - 1 - idx } else { idx };
                 if nchars < class.min_len() {
                     continue;
+                }
+                if !ctx.charge() {
+                    return None;
                 }
                 let mark = caps.len();
                 caps.push((*n, rest[..split].to_string()));
@@ -327,8 +359,28 @@ fn split_alternation(pattern: &str) -> Vec<String> {
     out
 }
 
+/// Replace %0..%99 in `body` with captures, escaping each one as data.
+///
+/// This is the door server text walks through to reach a script, so it is
+/// where rule 1 of the data discipline lives (see [`crate::data`]): the
+/// captured text is escaped on the way in, and every parser downstream
+/// preserves that escaping, so a capture can never become a command.
+/// Use this for anything derived from the server — trigger captures, event
+/// arguments. [`expand`] is the unescaped form, for user-authored text.
+pub fn expand_data(body: &str, caps: &[(u8, String)], all: &str) -> String {
+    let escaped: Vec<(u8, String)> = caps
+        .iter()
+        .map(|(i, text)| (*i, crate::data::escape(text)))
+        .collect();
+    expand(body, &escaped, &crate::data::escape(all))
+}
+
 /// Replace %0..%99 in `body` with captures. %0 defaults to `all` when the
 /// matcher didn't bind it.
+///
+/// The captures are inserted verbatim, so this is only safe for text the
+/// user authored (alias arguments they typed). For anything the server
+/// influenced, use [`expand_data`].
 pub fn expand(body: &str, caps: &[(u8, String)], all: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut chars = body.chars().peekable();

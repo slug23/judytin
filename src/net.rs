@@ -118,22 +118,51 @@ fn known_hosts_path() -> std::path::PathBuf {
     std::path::Path::new(&home).join(".judytin_known_hosts")
 }
 
-fn load_pin(hostport: &str) -> Option<String> {
-    let content = std::fs::read_to_string(known_hosts_path()).ok()?;
+/// What the pin file says about a host.
+enum Pinned {
+    /// Never seen; first sight will pin it.
+    Absent,
+    Fingerprint(String),
+    /// An entry exists but is unreadable. Deliberately distinct from
+    /// `Absent`: treating a damaged line as "no pin" would silently turn
+    /// pinning off for exactly the host someone tampered with, while the
+    /// client cheerfully reported a first connection.
+    Malformed,
+}
+
+fn load_pin(hostport: &str) -> Pinned {
+    let Ok(content) = std::fs::read_to_string(known_hosts_path()) else {
+        return Pinned::Absent;
+    };
     for line in content.lines() {
-        let mut parts = line.split_whitespace();
-        if parts.next() == Some(hostport) {
-            return parts.next().map(|s| s.to_string());
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some(hostport) {
+            continue;
+        }
+        return match parts.next() {
+            Some(fp) if fp.starts_with("sha256:") && fp.len() == 7 + 64 => {
+                Pinned::Fingerprint(fp.to_string())
+            }
+            _ => Pinned::Malformed,
+        };
     }
-    None
+    Pinned::Absent
 }
 
 fn store_pin(hostport: &str, fp: &str) -> std::io::Result<()> {
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(known_hosts_path())?;
+    let path = known_hosts_path();
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
     writeln!(f, "{} {}", hostport, fp)
 }
 
@@ -211,8 +240,18 @@ pub fn connect_tls(
     tx: Sender<Ev>,
 ) -> Result<(Conn, Pin), String> {
     let hostport = format!("{}:{}", host, port);
-    let expected = load_pin(&hostport);
-    let had_pin = expected.is_some();
+    let (expected, had_pin) = match load_pin(&hostport) {
+        Pinned::Fingerprint(fp) => (Some(fp), true),
+        Pinned::Absent => (None, false),
+        Pinned::Malformed => {
+            return Err(format!(
+                "the pin for {} in {} is unreadable. Refusing to connect rather than \
+                 silently trusting a new certificate — remove that line to start over.",
+                hostport,
+                known_hosts_path().display()
+            ));
+        }
+    };
     let verifier = Arc::new(TofuVerifier { expected, seen: std::sync::Mutex::new(None) });
 
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -244,12 +283,17 @@ pub fn connect_tls(
 
     let pin = {
         let seen = verifier.seen.lock().unwrap().clone();
-        match seen {
-            Some(fp) if !had_pin => {
+        match (seen, had_pin) {
+            (Some(fp), false) => {
                 store_pin(&hostport, &fp).map_err(|e| format!("cannot save pin: {}", e))?;
                 Pin::New(fp)
             }
-            _ => Pin::Known,
+            (Some(_), true) => Pin::Known,
+            // The verifier never ran, so nothing was checked. Say so rather
+            // than reporting a match we did not make.
+            (None, _) => {
+                return Err("TLS finished without presenting a certificate".to_string());
+            }
         }
     };
 
@@ -361,8 +405,11 @@ pub fn ssh_command(dest: &str) -> String {
         _ => (dest, None),
     };
     let port_arg = port.map(|p| format!("-p {} ", p)).unwrap_or_default();
+    // `--` so a destination beginning with '-' is a destination and not an
+    // option: without it, `--ssh -oProxyCommand=...` would be handed to ssh
+    // as configuration rather than a host to reach.
     format!(
-        "ssh -T -o BatchMode=yes -o ServerAliveInterval=30 {}{}",
+        "ssh -T -o BatchMode=yes -o ServerAliveInterval=30 {}-- {}",
         port_arg,
         shell_quote(target)
     )
@@ -393,12 +440,25 @@ mod tests {
     fn ssh_command_quotes_and_ports() {
         assert_eq!(
             ssh_command("play@mud.example.org"),
-            "ssh -T -o BatchMode=yes -o ServerAliveInterval=30 play@mud.example.org"
+            "ssh -T -o BatchMode=yes -o ServerAliveInterval=30 -- play@mud.example.org"
         );
         assert_eq!(
             ssh_command("grib@127.0.0.1:2322"),
-            "ssh -T -o BatchMode=yes -o ServerAliveInterval=30 -p 2322 grib@127.0.0.1"
+            "ssh -T -o BatchMode=yes -o ServerAliveInterval=30 -p 2322 -- grib@127.0.0.1"
         );
         assert!(ssh_command("a b").ends_with("'a b'"));
+    }
+
+    #[test]
+    fn ssh_destination_cannot_smuggle_options() {
+        // A destination beginning with '-' would otherwise be read by ssh as
+        // configuration — `-oProxyCommand=…` being the interesting one.
+        let cmd = ssh_command("-oProxyCommand=touch /tmp/x");
+        let after = cmd.split(" -- ").nth(1).expect("a -- separator");
+        assert!(after.starts_with('\''), "destination not quoted: {cmd}");
+        assert!(
+            cmd.contains(" -- '-oProxyCommand=touch /tmp/x'"),
+            "destination not confined behind --: {cmd}"
+        );
     }
 }

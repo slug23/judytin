@@ -1,9 +1,9 @@
 # judytin
 
 A [TinTin++](https://tintin.mudhalla.net/)-style MUD client, built for
-[judymud](../judymud) but happy on any MUD. One small Rust binary, one
-dependency (crossterm), and the tt++ scripting dialect your muscle memory
-already knows.
+[judymud](../judymud) but happy on any MUD. One small Rust binary, three
+dependencies (crossterm, rustls, sha2), and the tt++ scripting dialect your
+muscle memory already knows.
 
 ## Quick start
 
@@ -135,8 +135,63 @@ the line instead of nothing). Not implemented: `#map` automapper, `#chat`
 /`#port` inter-client networking, multiple simultaneous sessions, MCCP
 compression, PCRE embedding in patterns.
 
+## Security
+
+A MUD client runs a scripting language over text a stranger sends you.
+That is the whole threat model, and it is not hypothetical: the classic
+attack is a server that makes your own trigger execute its text.
+
+```
+#action {%1 tells you %2} {tell %1 got it}      your trigger
+Bob;#system rm -rf ~ tells you hi               what the server sends
+```
+
+judytin treats server text as **data, never code**. It is escaped the
+moment it enters a script, every parser preserves that escaping rather than
+acting on it, and the escape is removed only at the end of the line — where
+the text is sent to the MUD, printed, or evaluated. So a capture can carry
+`;`, `#`, `{`, `$`, `@` or a quote and none of them become syntax, however
+many layers of alias, function, variable and `#delay` it passes through.
+See [`src/data.rs`](src/data.rs) for the reasoning.
+
+Behind that, a second line of defence: commands with effects outside the
+game — `#system`, `#run`, `#read`, `#write`, `#log`, `#textin` — refuse to
+run when a trigger or event caused them, even indirectly through a timer.
+Type one yourself and it works normally. `#config {trigger shell} on` lifts
+the restriction if you need it; only do that for a MUD you would trust with
+your shell.
+
+Also deliberate:
+
+- **Only colour is relayed to your terminal.** Your terminal is an
+  interpreter too. Clipboard writes (`OSC 52`), title reporting — which can
+  echo attacker text back onto your input line — and cursor control are
+  filtered out of server output; SGR colour passes through.
+- **Line length and match effort are bounded**, so a server cannot exhaust
+  memory with a line that never ends, or freeze the client with a padded
+  one.
+- **TLS pinning fails closed.** A changed certificate is refused, and so is
+  a damaged entry in `~/.judytin_known_hosts` — rather than silently
+  treating it as a first connection. Note this is trust-on-first-use, like
+  ssh: the first connection is trusted blind, and hostnames are not checked
+  against the certificate, so the pin is the whole identity.
+- Session logs and the pin file are created `0600`, and nothing is echoed
+  to screen or log while the server has taken ECHO for a password prompt.
+
+Known and accepted: `#system` and `#run` execute shell commands *you* type,
+`$variables` interpolate into them unquoted, and `#read` runs a script
+file — so only load scripts you would run as programs. Trigger patterns
+themselves are user-authored and trusted.
+
+Found something? Please open an issue.
+
 ## Development
 
 ```
-cargo test    # unit tests + end-to-end tests against a mock MUD server
+cargo test    # unit tests, end-to-end tests, and tests/security.rs —
+              # a suite of hostile MUD servers, each one a real attack
 ```
+
+`tests/security.rs` is the interesting one: every test in it is a server
+trying to execute code, crash the client, or steer a script, and several
+are regressions for bugs that were live.

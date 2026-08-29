@@ -3,6 +3,7 @@
 mod ansi;
 mod app;
 mod commands;
+mod data;
 mod expr;
 mod fmt;
 mod net;
