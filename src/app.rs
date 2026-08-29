@@ -32,6 +32,9 @@ pub enum Ev {
     StdinEof,
     Net(u64, Vec<u8>),
     NetClosed(u64, String),
+    /// judytin's own note about the connection — never server text, so it is
+    /// shown as an info line and never fed to the trigger engine.
+    NetDiag(u64, String),
 }
 
 #[allow(clippy::large_enum_variant)] // single instance, always the Split arm in practice
@@ -452,14 +455,26 @@ impl App {
         }
     }
 
+    /// Connect through the system ssh. Separate from `connect_pipe` because
+    /// judytin built this command line itself and so can read the child's
+    /// stderr as ssh's, which a bare `#run` cannot.
+    pub fn connect_ssh(&mut self, dest: &str) {
+        let command = net::ssh_command(dest);
+        self.start_pipe(dest, &command, Some(dest));
+    }
+
     pub fn connect_pipe(&mut self, label: &str, command: &str) {
+        self.start_pipe(label, command, None);
+    }
+
+    fn start_pipe(&mut self, label: &str, command: &str, ssh_dest: Option<&str>) {
         if self.conn.is_some() {
             self.info("already connected — #zap first");
             return;
         }
         self.info(&format!("running {} ...", command));
         self.conn_id += 1;
-        match net::connect_pipe(command, self.conn_id, self.tx.clone()) {
+        match net::connect_pipe(command, ssh_dest, self.conn_id, self.tx.clone()) {
             Ok(conn) => self.finish_connect(conn, label, 0),
             Err(e) => self.info(&format!("cannot run '{}': {}", command, e)),
         }
@@ -576,6 +591,11 @@ impl App {
             Ev::Net(id, bytes) => {
                 if id == self.conn_id {
                     self.on_net_data(&bytes);
+                }
+            }
+            Ev::NetDiag(id, note) => {
+                if id == self.conn_id {
+                    self.info(&note);
                 }
             }
             Ev::NetClosed(id, why) => {

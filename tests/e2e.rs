@@ -175,6 +175,67 @@ fn tls_transport_with_tofu_pinning() {
 }
 
 #[test]
+fn a_tls_mud_that_hangs_up_bluntly_still_says_goodbye_plainly() {
+    // judymud, and most muds, close the socket after `quit` without sending a
+    // TLS close_notify. rustls reports that as an error whose text carries a
+    // link to its own manual — true, and none of a player's business. Telnet
+    // and pipe both say "connection closed" here; TLS must not be the odd one.
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert = ck.cert.der().clone();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.signing_key.serialize_der().into());
+    let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert], key)
+    .unwrap();
+    let config = std::sync::Arc::new(config);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        let conn = rustls::ServerConnection::new(config).unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, sock);
+        tls.write_all(b"Welcome to bluntmud\r\n> ").unwrap();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = match tls.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if String::from_utf8_lossy(&buf[..n]).contains("quit") {
+                tls.write_all(b"Goodbye.\r\n").unwrap();
+                let _ = tls.flush();
+                break; // drop the socket — deliberately no close_notify
+            }
+        }
+    });
+
+    // Start from nothing: a pin left by an earlier run under a recycled pid
+    // would be a pin for a different throwaway cert, and the mismatch would
+    // look like a failure of this test rather than of its housekeeping.
+    let home = std::env::temp_dir().join(format!("judytin-blunt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let home_s = home.to_string_lossy().to_string();
+    let out = run_judytin_with(
+        &["--dumb", "--tls", "127.0.0.1", &port.to_string()],
+        "quit\n",
+        &[("HOME", home_s.as_str())],
+    );
+    server.join().unwrap();
+
+    assert!(out.contains("Goodbye."), "never reached the mud:\n{}", out);
+    assert!(out.contains("connection closed"), "no plain goodbye:\n{}", out);
+    assert!(!out.contains("docs.rs"), "leaked a library manual:\n{}", out);
+    assert!(!out.contains("close_notify"), "leaked TLS internals:\n{}", out);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn scripting_engine_end_to_end() {
     let (port, server) = spawn_mock();
     let script = "\

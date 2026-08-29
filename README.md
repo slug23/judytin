@@ -109,6 +109,17 @@ Three ways to reach a MUD, indistinguishable above the socket:
   *is* the identity: an unknown key rolls a guest character, the same key
   resumes it — no resume key to keep.
 
+  One wrinkle worth knowing before it bites you: judytin runs ssh with
+  `BatchMode=yes`, because there is no terminal behind the pipe and a
+  prompt would hang where nobody could answer it. That includes ssh's
+  *first* prompt, the one asking whether you trust a new server — so the
+  first `--ssh` to a host you have never met stops at `Host key
+  verification failed`. judytin says as much when it happens, and names the
+  cure: check the key against what the server's owner published, then
+  `ssh-keyscan -p 2322 host >> ~/.ssh/known_hosts` once. Unlike TLS, where
+  judytin pins on first sight, this trust decision stays with ssh and stays
+  deliberate.
+
 ## What it does under the hood
 
 - **Split screen** the way tt++ does it: a VT100 scroll region for output, a

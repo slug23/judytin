@@ -150,7 +150,7 @@ fn main() {
 
     if !args.offline {
         if let Some(dest) = &args.ssh {
-            app.connect_pipe(dest, &net::ssh_command(dest));
+            app.connect_ssh(dest);
         } else if args.tls {
             app.connect_tls(&args.host, args.port.unwrap_or(2324));
         } else {
