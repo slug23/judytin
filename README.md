@@ -64,7 +64,9 @@ default host on port 4000. Two arguments are still host then port.
 
 Commands start with `#` and may be abbreviated (`#al`, `#act`, `#high`, ...).
 `;` separates commands, `{}` groups arguments, `%1`–`%99` are
-wildcards/arguments, `$name` inserts a variable, `@func{args}` calls a
+wildcards/arguments, `$name` inserts a variable (`$name[key]` an entry in a
+keyed one, nesting as `$a[b][c]`, with the key itself computed if you write
+`$hp[$who]`), `@func{args}` calls a
 function, `#5 {commands}` repeats five times, `!` recalls history, Tab
 completes words from recent output.
 
@@ -232,7 +234,8 @@ its name. If the machine cannot say, it falls back to UTC and `%Z` says
 `UTC`, so a timestamp is never confidently wrong.
 
 Not implemented: `#map` automapper, `#chat`/`#port` inter-client
-networking, PCRE embedding in patterns. MCCP compression is not merely
+networking, PCRE embedding in patterns, and `#list` — keyed variables exist
+(`$var[key]`) but the collection operations that build and walk them do not. MCCP compression is not merely
 absent — judytin refuses the offer, and the refusal is deliberate: a
 decompressor on a stranger's byte stream is a zip bomb waiting to happen,
 and it would cost a dependency to gain nothing against a server that sends

@@ -294,6 +294,57 @@ fn a_trigger_may_still_reopen_a_socket() {
     );
 }
 
+#[test]
+fn a_capture_cannot_close_the_subscript_it_landed_in() {
+    // $var[key] made [ and ] syntax. A capture spliced into a subscript is
+    // therefore in the same position a capture inside {braces} was before the
+    // data discipline existed: close the bracket early and the remainder of
+    // the line is read as script rather than as a key.
+    let m = marker("subscript");
+    let port = hostile_server(vec![format!(
+        "x];#system touch {} ;#nop [ arrives\r\n",
+        m.display()
+    )]);
+    let out = run(
+        port,
+        "#variable {tbl[x]} {harmless}\n\
+         #action {%1 arrives} {#showme $tbl[%1]}\n\
+         #delay {2} {#end}\n",
+    );
+    assert_not_created(&m, "a `]` in a capture closed the subscript around it");
+    // The trigger should still have run, printing the unresolved name as text.
+    assert!(
+        out.says("$tbl["),
+        "the trigger did not fire at all, so this proves nothing:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn a_capture_cannot_pick_which_entry_a_table_lookup_returns() {
+    // Subtler than execution, and the reason $tbl[$key] resolves the key
+    // before looking up rather than after: server text must not be able to
+    // reach a *different* entry than the one the script named. Here the
+    // trigger looks up tbl[safe]; the server tries to redirect it to
+    // tbl[secret] by closing and reopening the subscript.
+    let port = hostile_server(vec!["secret] $tbl[ arrives\r\n".to_string()]);
+    let out = run(
+        port,
+        "#variable {tbl[safe]} {public-value}\n\
+         #variable {tbl[secret]} {PRIVATE-VALUE}\n\
+         #action {%1 arrives} {#showme got $tbl[safe]}\n\
+         #delay {2} {#end}\n",
+    );
+    // Compared against the showme output, not the whole transcript: setting the
+    // variable echoes its value, so a bare search would match the setup.
+    assert!(
+        !out.did("got PRIVATE-VALUE"),
+        "server text steered a table lookup to another entry:\n{}",
+        out.stdout
+    );
+    assert!(out.did("got public-value"), "the lookup did not happen:\n{}", out.stdout);
+}
+
 // ---- crashes and exhaustion -------------------------------------------
 
 #[test]
@@ -332,17 +383,22 @@ fn a_line_that_never_ends_does_not_exhaust_memory_or_time() {
     // single-threaded event loop.
     let flood = "A".repeat(400_000);
     let port = hostile_server(vec![flood.clone(), flood]);
-    let started = std::time::Instant::now();
     let out = run(
         port,
         "#action {%1 tells you %2} {say hi %1}\n#delay {3} {#end}\n",
     );
-    let elapsed = started.elapsed();
     assert!(!out.says("panicked"), "crashed on a newline-less flood:\n{}", out.stdout);
-    assert!(
-        elapsed < Duration::from_secs(15),
-        "client froze on a newline-less flood: {:?}",
-        elapsed
+    // Freezing is proved by the timer never firing, not by a stopwatch. `run`
+    // kills the client after 20 seconds, so a clean exit means the event loop
+    // was still servicing #delay while the flood arrived — which is the actual
+    // claim. Timing the wall clock instead measured whatever else the machine
+    // was doing: this test swung between 3 and 15 seconds on an unchanged
+    // client, and failed whenever the suite grew.
+    assert_eq!(
+        out.status,
+        Some(0),
+        "the event loop stopped servicing timers under a flood:\n{}",
+        out.stdout
     );
 }
 

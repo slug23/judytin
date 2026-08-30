@@ -122,8 +122,15 @@ pub fn get_tail(rest: &str) -> String {
     rest.to_string()
 }
 
-/// Substitute `$name` / `${name}` via `lookup`. An escaped `\$` is data:
-/// preserved as-is, never treated as a variable reference.
+/// Substitute `$name`, `${name}` and `$name[key]` via `lookup`. An escaped
+/// `\$` is data: preserved as-is, never treated as a variable reference.
+///
+/// Subscripts are read from the template, and an escaped `\]` inside one is
+/// data rather than the closing bracket — which is what stops a server whose
+/// text landed in `$tbl[%1]` from ending the subscript early and having the
+/// remainder read as something else. A subscript may itself contain variables,
+/// resolved before the lookup, so `$tbl[$key]` works; the recursion is bounded
+/// by the nesting actually written in the template.
 pub fn subst_vars_with(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -157,6 +164,40 @@ pub fn subst_vars_with(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> S
                             break;
                         }
                     }
+                }
+                // Subscripts, possibly several: $a[b][c] is one name.
+                let mut subscripts = String::new();
+                while chars.peek() == Some(&'[') {
+                    chars.next();
+                    let mut key = String::new();
+                    let mut depth = 1usize;
+                    while let Some(n) = chars.next() {
+                        if n == '\\' {
+                            // An escaped bracket is data. Keep the pair intact
+                            // so the recursive call sees it as data too.
+                            key.push('\\');
+                            if let Some(esc) = chars.next() {
+                                key.push(esc);
+                            }
+                            continue;
+                        }
+                        if n == '[' {
+                            depth += 1;
+                        } else if n == ']' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        key.push(n);
+                    }
+                    let key = subst_vars_with(&key, lookup);
+                    subscripts.push('[');
+                    subscripts.push_str(&key);
+                    subscripts.push(']');
+                }
+                if !subscripts.is_empty() {
+                    name.push_str(&subscripts);
                 }
                 if name.is_empty() {
                     out.push('$');
@@ -304,6 +345,46 @@ mod tests {
             subst_vars(r"costs \$5 and $unknown", &vars),
             r"costs \$5 and $unknown"
         );
+    }
+
+    #[test]
+    fn subscripts_name_one_variable() {
+        let mut vars = BTreeMap::new();
+        vars.insert("hp[bob]".to_string(), "30".to_string());
+        vars.insert("hp[amy]".to_string(), "45".to_string());
+        vars.insert("who".to_string(), "amy".to_string());
+        vars.insert("deep[a][b]".to_string(), "nested".to_string());
+        assert_eq!(subst_vars("$hp[bob]", &vars), "30");
+        // The key is resolved before the lookup, so it can be computed.
+        assert_eq!(subst_vars("$hp[$who]", &vars), "45");
+        assert_eq!(subst_vars("$deep[a][b]", &vars), "nested");
+        // Unknown entries stay literal, as tt++ leaves unknown variables.
+        assert_eq!(subst_vars("$hp[nobody]", &vars), "$hp[nobody]");
+    }
+
+    #[test]
+    fn escaped_data_in_a_subscript_stays_data() {
+        // The attack shape: server text lands inside $tbl[...] and tries to
+        // close the subscript early so what follows is read as script. Every
+        // metacharacter in it arrives escaped, and the scan must carry those
+        // pairs through rather than acting on the character underneath.
+        let mut vars = BTreeMap::new();
+        vars.insert("tbl[safe]".to_string(), "public".to_string());
+        vars.insert("tbl[secret]".to_string(), "PRIVATE".to_string());
+        // What `escape` would produce from `] $tbl[secret]`.
+        let out = subst_vars(r"$tbl[safe\] \$tbl\[secret\]", &vars);
+        assert!(
+            !out.contains("PRIVATE"),
+            "escaped server text reached another entry: {out}"
+        );
+        assert!(
+            !out.contains("public"),
+            "the escaped bracket still closed the subscript: {out}"
+        );
+
+        // The same characters unescaped are the script author's own, and do
+        // resolve — that is the difference the escaping exists to make.
+        assert_eq!(subst_vars("$tbl[secret]", &vars), "PRIVATE");
     }
 
     #[test]

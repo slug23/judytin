@@ -48,7 +48,12 @@
 /// `"` is included because the expression language quotes strings with it,
 /// and data that can close its own quote can rewrite the comparison around
 /// it — enough to steer a scripted decision even without running anything.
-const META: &[char] = &['\\', ';', '{', '}', '$', '@', '#', '%', '"'];
+/// `[` and `]` are here because `$var[key]` made them syntax. Before that they
+/// were ordinary text; now a `]` arriving from a server could close a subscript
+/// the player opened, so they escape like every other metacharacter. Note that
+/// ANSI sequences contain `[` and reach here through RECEIVED LINE — escaping
+/// and unescaping round-trips them, which is why the sink rule matters.
+const META: &[char] = &['\\', ';', '{', '}', '$', '@', '#', '%', '"', '[', ']'];
 
 /// Escape server-derived text so no parser downstream reads it as syntax.
 pub fn escape(text: &str) -> String {
