@@ -67,8 +67,14 @@ impl Run {
 
 /// Run the real binary against a port, feeding it `script` on stdin.
 fn run(port: u16, script: &str) -> Run {
+    // An empty HOME, so ~/.judytinrc cannot arm anything an attack test is
+    // about to rely on being off. The suite must measure judytin, not whoever
+    // is running it.
+    let empty = std::env::temp_dir().join(format!("judytin-nohome-{}", std::process::id()));
+    std::fs::create_dir_all(&empty).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_judytin"))
         .args(["--dumb", "127.0.0.1", &port.to_string()])
+        .env("HOME", &empty)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

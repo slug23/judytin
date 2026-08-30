@@ -74,7 +74,7 @@ impl App {
                 self.info("goodbye — judytin signing off");
                 self.quit = true;
             }
-            "zap" => self.disconnect(false),
+            "zap" => self.close_session(),
             "reconnect" => self.cmd_reconnect(),
             "session" => self.cmd_session(rest, depth),
             "ssl" => self.cmd_ssl(rest, depth),
@@ -1515,33 +1515,41 @@ impl App {
         // "server decides when judytin spawns processes" is the thing the gate
         // exists to prevent. Sockets are not gated: reopening one costs the
         // server the same connection it just dropped.
-        if matches!(self.last_session, Some(crate::app::Recipe::Pipe { .. }))
+        if matches!(self.s().recipe, Some(crate::app::Recipe::Pipe { .. }))
             && !self.guard_local_effects("#reconnect")
         {
             return;
         }
         self.cancel_reconnect();
-        if let Some(how) = self.last_session.clone() {
+        if let Some(how) = self.s().recipe.clone() {
             self.info(&format!("reconnecting to {} ...", how.describe()));
         }
         self.reconnect(true);
     }
 
+    /// `#session` lists, `#session {name}` switches, `#session {name} {host}
+    /// {port}` opens. The three-argument form is what tt++ has always had; the
+    /// first two only became meaningful once judytin could hold more than one.
     fn cmd_session(&mut self, rest: &str, depth: u32) {
         let (name, r2) = get_arg(rest);
         let (host, r3) = get_arg(r2);
         let (port_s, _) = get_arg(r3);
         if name.is_empty() {
-            if self.connected() {
-                let msg = format!("connected to {}:{}", self.host, self.port);
-                self.info(&msg);
-            } else {
-                self.info("no session. usage: #session {name} {host} {port}");
-            }
+            self.list_sessions();
             return;
         }
+        let name = crate::data::unescape(&self.subst(&name, depth));
         if host.is_empty() {
-            self.info("usage: #session {name} {host} {port}");
+            if self.switch_to(&name) {
+                let msg = format!("now on {}", self.s().label());
+                self.info(&msg);
+            } else {
+                self.info(&format!(
+                    "no session called {} — #session lists them, \
+                     #session {{{}}} {{host}} {{port}} opens it",
+                    name, name
+                ));
+            }
             return;
         }
         let host = self.subst(&host, depth);
@@ -1553,11 +1561,37 @@ impl App {
                 return;
             }
         };
-        self.connect(&host, port);
+        if self.open_session(&name) {
+            self.connect(&host, port);
+        }
+    }
+
+    /// What is open, and which one is listening to you.
+    fn list_sessions(&mut self) {
+        let rows: Vec<String> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let here = if i == self.cur { "*" } else { " " };
+                let where_ = match (&x.conn, x.port) {
+                    // A pipe session's "host" is its own name, so printing it
+                    // would just say the name twice.
+                    (Some(c), 0) => format!("({})", c.kind()),
+                    (Some(c), p) => format!("{}:{} ({})", x.host, p, c.kind()),
+                    (None, _) => "not connected".to_string(),
+                };
+                format!("{} {} — {}", here, x.label(), where_)
+            })
+            .collect();
+        for row in rows {
+            self.info(&row);
+        }
+        self.info("* is where typing goes. #session {name} switches.");
     }
 
     fn cmd_ssl(&mut self, rest: &str, depth: u32) {
-        let (_name, r2) = get_arg(rest);
+        let (name, r2) = get_arg(rest);
         let (host, r3) = get_arg(r2);
         let (port_s, _) = get_arg(r3);
         if host.is_empty() {
@@ -1577,7 +1611,10 @@ impl App {
                 }
             }
         };
-        self.connect_tls(&host, port);
+        let name = crate::data::unescape(&self.subst(&name, depth));
+        if self.open_session(&name) {
+            self.connect_tls(&host, port);
+        }
     }
 
     fn cmd_run(&mut self, rest: &str, depth: u32) {
@@ -1591,7 +1628,10 @@ impl App {
             return;
         }
         let command = crate::data::unescape(&self.subst(&command, depth));
-        self.connect_pipe(&crate::data::unescape(&name), &command);
+        let name = crate::data::unescape(&name);
+        if self.open_session(&name) {
+            self.connect_pipe(&name, &command);
+        }
     }
 
     /// Refuse commands with effects outside the game when the server caused
@@ -1837,7 +1877,8 @@ impl App {
   %1..%99 are wildcards/arguments, $name inserts a variable, @func{} calls\r
   #5 {commands} repeats 5 times, ! recalls history, tab completes words\r
 \r
-  \x1b[1msession\x1b[0m   #session {name} {host} {port}, #zap, #end\r
+  \x1b[1msession\x1b[0m   #session {name} {host} {port} opens, #zap closes, #end quits\r
+            #session lists them, #session {name} switches between them\r
             #reconnect  return to the last session, whatever the transport\r
             #config {reconnect} {on}  keep retrying after a server-side drop\r
             #ssl {name} {host} {port} telnet-over-TLS (pin kept in ~/.judytin_known_hosts)\r

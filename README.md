@@ -158,6 +158,31 @@ Three ways to reach a MUD, indistinguishable above the socket:
   standing in the middle, and appending the new key is the one thing not to
   do.
 
+### More than one session
+
+judytin holds several connections at once and sends what you type to one of
+them.
+
+```
+#session {mud} {127.0.0.1} {2323}   open one, named
+#ssl {secure} {mudhost} {2324}      or over TLS
+#run {ssh} {ssh -T you@mudhost}     or through anything that speaks bytes
+#session                            list them; * marks where typing goes
+#session {mud}                      switch to it
+#zap                                close this one and fall back to another
+```
+
+Text from a session you are not watching arrives tagged with its name, so
+two muds talking at once stay distinguishable and nothing is silently
+dropped. Triggers fire for background sessions too, and reply to the session
+whose line set them off rather than to whichever you happen to be looking
+at. Each session keeps its own connection, telnet state, reconnect settings
+and input queue; aliases, triggers and variables stay global, shared by all
+of them.
+
+With one session open judytin behaves exactly as it did before, including
+`#zap` leaving it disconnected but remembered, so `#reconnect` still works.
+
 ### Coming back after a drop
 
 `#reconnect` returns to the last session — whatever transport it was, without

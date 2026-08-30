@@ -62,6 +62,15 @@ fn run_judytin(port: u16, script: &str) -> String {
 fn run_judytin_with(args: &[&str], script: &str, envs: &[(&str, &str)]) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_judytin"));
     cmd.args(args);
+    // judytin reads ~/.judytinrc at startup, so without this a test measures
+    // whoever is running it. A developer who turns on #config {reconnect} in
+    // their own rc should not thereby fail the test asserting it defaults off.
+    if !envs.iter().any(|(k, _)| *k == "HOME") {
+        let empty = std::env::temp_dir().join(format!("judytin-nohome-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let _ = std::fs::remove_file(empty.join(".judytinrc"));
+        cmd.env("HOME", &empty);
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -261,6 +270,174 @@ fn spawn_restarting_mock(
         }
     });
     (port, count, handle)
+}
+
+/// Drop ANSI SGR sequences, so an assertion can be written in the words a
+/// player reads rather than in the escape codes around them.
+fn plain(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A named echo mock, so two of them can be told apart in one transcript.
+fn spawn_named_mock(tag: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let _ = sock.write_all(format!("{} greets you\r\n", tag).as_bytes());
+        // An unprompted line later on, which is the interesting case: it may
+        // well arrive while this session is not the one being watched.
+        if let Ok(mut w) = sock.try_clone() {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1000));
+                let _ = w.write_all(format!("{} mutters later\r\n", tag).as_bytes());
+            });
+        }
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(4000)));
+        let mut buf = [0u8; 1024];
+        let mut line = Vec::new();
+        while let Ok(n) = sock.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            for &b in &buf[..n] {
+                if b == b'\n' {
+                    let text = String::from_utf8_lossy(&line).trim().to_string();
+                    line.clear();
+                    if !text.is_empty() {
+                        let _ = sock.write_all(format!("{} heard {}\r\n", tag, text).as_bytes());
+                    }
+                } else if b != b'\r' {
+                    line.push(b);
+                }
+            }
+        }
+    });
+    (port, handle)
+}
+
+#[test]
+fn two_sessions_stay_apart_and_typing_follows_the_current_one() {
+    let (pa, sa) = spawn_named_mock("alpha");
+    let (pb, sb) = spawn_named_mock("beta");
+    let out = run_judytin_with(
+        &["--dumb", "--offline"],
+        &format!(
+            "#session {{a}} {{127.0.0.1}} {{{pa}}}\n\
+             #delay {{0.5}} {{#session {{b}} {{127.0.0.1}} {{{pb}}}}}\n\
+             #delay {{1.2}} {{hello from b}}\n\
+             #delay {{1.8}} {{#session {{a}}}}\n\
+             #delay {{2.4}} {{hello from a}}\n\
+             #delay {{3.2}} {{#end}}\n"
+        ),
+        &[],
+    );
+    sa.join().unwrap();
+    sb.join().unwrap();
+    // Each line reached the session that was current when it was typed.
+    assert!(out.contains("beta heard hello from b"), "b did not get its line:\n{}", out);
+    assert!(out.contains("alpha heard hello from a"), "a did not get its line:\n{}", out);
+    assert!(!out.contains("alpha heard hello from b"), "line leaked to a:\n{}", out);
+    assert!(!out.contains("beta heard hello from a"), "line leaked to b:\n{}", out);
+}
+
+#[test]
+fn background_output_says_which_session_it_came_from() {
+    let (pa, sa) = spawn_named_mock("alpha");
+    let (pb, sb) = spawn_named_mock("beta");
+    let out = run_judytin_with(
+        &["--dumb", "--offline"],
+        &format!(
+            "#session {{a}} {{127.0.0.1}} {{{pa}}}\n\
+             #delay {{0.5}} {{#session {{b}} {{127.0.0.1}} {{{pb}}}}}\n\
+             #delay {{1.2}} {{poke}}\n\
+             #delay {{2.2}} {{#end}}\n"
+        ),
+        &[],
+    );
+    sa.join().unwrap();
+    sb.join().unwrap();
+    let out = plain(&out);
+    // b is current, so its own text is bare...
+    assert!(out.contains("beta heard poke"), "current session went missing:\n{}", out);
+    assert!(!out.contains("[b] beta heard poke"), "current session was tagged:\n{}", out);
+    // ...while a, which is in the background by the time it mutters, is named.
+    assert!(
+        out.contains("[a] alpha mutters later"),
+        "background output arrived unlabelled:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("[b] beta mutters later"),
+        "foreground output was labelled:\n{}",
+        out
+    );
+}
+
+#[test]
+fn session_lists_what_is_open_and_marks_the_current_one() {
+    let (pa, sa) = spawn_named_mock("alpha");
+    let out = run_judytin_with(
+        &["--dumb", "--offline"],
+        &format!(
+            "#session {{a}} {{127.0.0.1}} {{{pa}}}\n\
+             #delay {{0.6}} {{#session}}\n\
+             #delay {{1.4}} {{#end}}\n"
+        ),
+        &[],
+    );
+    sa.join().unwrap();
+    let out = plain(&out);
+    assert!(
+        out.contains("* a — 127.0.0.1:"),
+        "listing did not mark the current session:\n{}",
+        out
+    );
+}
+
+#[test]
+fn switching_to_a_session_that_is_not_there_says_so() {
+    let out = run_judytin_with(&["--dumb", "--offline"], "#session {nope}\n", &[]);
+    assert!(
+        out.contains("no session called nope"),
+        "invented a session:\n{}",
+        out
+    );
+}
+
+#[test]
+fn zapping_one_of_several_leaves_the_others_alone() {
+    let (pa, sa) = spawn_named_mock("alpha");
+    let (pb, sb) = spawn_named_mock("beta");
+    let out = run_judytin_with(
+        &["--dumb", "--offline"],
+        &format!(
+            "#session {{a}} {{127.0.0.1}} {{{pa}}}\n\
+             #delay {{0.5}} {{#session {{b}} {{127.0.0.1}} {{{pb}}}}}\n\
+             #delay {{1.2}} {{#zap}}\n\
+             #delay {{1.8}} {{still here}}\n\
+             #delay {{2.6}} {{#end}}\n"
+        ),
+        &[],
+    );
+    sa.join().unwrap();
+    sb.join().unwrap();
+    assert!(out.contains("closed b — now on a"), "zap did not hand over:\n{}", out);
+    // a survived and is now taking the typing.
+    assert!(out.contains("alpha heard still here"), "the survivor went deaf:\n{}", out);
 }
 
 #[test]

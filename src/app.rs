@@ -61,6 +61,59 @@ impl Recipe {
     }
 }
 
+/// One connection and everything that belongs to it.
+///
+/// Split out of App so judytin can hold several at once. Scripting — aliases,
+/// triggers, variables, classes — stays global, as it was: what is per-session
+/// is the socket and the state that only makes sense beside a socket.
+pub(crate) struct Session {
+    /// What #session called it. Empty for the one judytin starts with, which
+    /// nobody named.
+    pub(crate) name: String,
+    pub(crate) conn: Option<Conn>,
+    /// Unique across every session ever opened, so a late packet from a
+    /// connection that has already gone cannot be mistaken for a live one.
+    pub(crate) conn_id: u64,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) telnet: Telnet,
+    pub(crate) line_buf: String,
+    pub(crate) line_written: usize,
+    /// How to get back here — see `Recipe`.
+    pub(crate) recipe: Option<Recipe>,
+    pub(crate) retry_at: Option<Instant>,
+    pub(crate) retry_n: u32,
+    pub(crate) settling: Option<Instant>,
+    pub(crate) settle_cap: Option<Instant>,
+    pub(crate) held: std::collections::VecDeque<String>,
+}
+
+impl Session {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            conn: None,
+            conn_id: 0,
+            host: String::new(),
+            port: 0,
+            telnet: Telnet::new(),
+            line_buf: String::new(),
+            line_written: 0,
+            recipe: None,
+            retry_at: None,
+            retry_n: 0,
+            settling: None,
+            settle_cap: None,
+            held: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// How it reads in a listing or a prefix.
+    pub(crate) fn label(&self) -> &str {
+        if self.name.is_empty() { "-" } else { &self.name }
+    }
+}
+
 #[allow(clippy::large_enum_variant)] // single instance, always the Split arm in practice
 pub enum Ui {
     Split(SplitUi),
@@ -135,32 +188,23 @@ pub struct App {
     pub(crate) path_pos: usize,
     pub(crate) path_mapping: bool,
     pub(crate) pathdirs: BTreeMap<String, String>,
-    conn: Option<Conn>,
-    conn_id: u64,
-    /// The last connection judytin made, kept across disconnects.
-    pub(crate) last_session: Option<Recipe>,
+    /// Every open session, in the order they were made. Never empty: judytin
+    /// always has a current session even when it holds no connection, which is
+    /// what `--offline` is.
+    pub(crate) sessions: Vec<Session>,
+    /// Index into `sessions` of the one that typing goes to.
+    pub(crate) cur: usize,
+    /// Rises with every connection across all sessions, never reused, so a
+    /// packet from a session that has since closed cannot be delivered to
+    /// whichever one happens to sit at the same index now.
+    next_conn_id: u64,
+    /// Set while judytin is handling a session other than the one the player
+    /// is looking at, so its output can say where it came from.
+    bg: Option<String>,
     /// Opt-in. Off by default because judytin cannot tell the server crashing
     /// from you typing the game's own quit command — both are just a socket
     /// closing — so arming this is a choice the player makes knowing that.
     pub(crate) reconnect_on: bool,
-    /// When the next automatic attempt is due, if one is pending.
-    retry_at: Option<Instant>,
-    /// Attempts since the last success, which is what stretches the backoff.
-    retry_n: u32,
-    /// When held text may go. Pushed back by each thing the server says, so
-    /// the release lands after its opening burst rather than in the middle of
-    /// one — see `send_line`.
-    settling: Option<Instant>,
-    /// The furthest that pushing back may reach, so a chatty server cannot
-    /// hold the player's input open indefinitely.
-    settle_cap: Option<Instant>,
-    /// Player lines waiting for that opening.
-    held: std::collections::VecDeque<String>,
-    pub(crate) host: String,
-    pub(crate) port: u16,
-    telnet: Telnet,
-    line_buf: String,
-    line_written: usize,
     /// Bytes not yet forming a whole UTF-8 character, held across packets.
     byte_buf: Vec<u8>,
     /// An escape sequence that arrived only partly, held until it finishes.
@@ -230,20 +274,11 @@ impl App {
             path_pos: 0,
             path_mapping: false,
             pathdirs: default_pathdirs(),
-            conn: None,
-            conn_id: 0,
-            last_session: None,
+            sessions: vec![Session::new("")],
+            cur: 0,
+            next_conn_id: 0,
+            bg: None,
             reconnect_on: false,
-            retry_at: None,
-            retry_n: 0,
-            settling: None,
-            settle_cap: None,
-            held: std::collections::VecDeque::new(),
-            host: String::new(),
-            port: 0,
-            telnet: Telnet::new(),
-            line_buf: String::new(),
-            line_written: 0,
             byte_buf: Vec::new(),
             esc_buf: String::new(),
             flush_deadline: None,
@@ -254,6 +289,20 @@ impl App {
 
     /// Raw output (already \r\n-terminated where needed).
     pub fn output(&mut self, raw: &str) {
+        // Text from a session the player is not looking at says so. Losing it
+        // would be worse, and showing it unmarked would be worse still: two
+        // muds talking at once with nothing to tell them apart.
+        if let Some(name) = self.bg.clone() {
+            let tagged = raw
+                .split_inclusive("\r\n")
+                .map(|l| format!("\x1b[2m[{}]\x1b[0m {}", name, l))
+                .collect::<String>();
+            return self.write_out(&tagged);
+        }
+        self.write_out(raw);
+    }
+
+    fn write_out(&mut self, raw: &str) {
         if let Some(log) = &mut self.log_file {
             let (plain, _) = strip_map(raw);
             let _ = log.write_all(plain.replace('\r', "").as_bytes());
@@ -287,14 +336,25 @@ impl App {
     }
 
     pub fn update_status(&mut self) {
-        let state = match &self.conn {
-            Some(c) if self.port > 0 => {
-                format!("{}:{} ─ {}", self.host, self.port, c.kind())
+        let state = match &self.s().conn {
+            Some(c) if self.s().port > 0 => {
+                format!("{}:{} ─ {}", self.s().host, self.s().port, c.kind())
             }
-            Some(c) => format!("{} ─ {}", self.host, c.kind()),
+            Some(c) => format!("{} ─ {}", self.s().host, c.kind()),
             None => "offline".to_string(),
         };
-        let text = format!("judytin ─ {}", state);
+        // With more than one session open, which one you are typing at is the
+        // single most important thing the bar can tell you.
+        let text = if self.sessions.len() > 1 {
+            format!(
+                "judytin ─ {} ─ {} of {}",
+                state,
+                self.s().label(),
+                self.sessions.len()
+            )
+        } else {
+            format!("judytin ─ {}", state)
+        };
         if let Ui::Split(ui) = &mut self.ui {
             let _ = ui.set_status(&text);
         }
@@ -471,13 +531,15 @@ impl App {
     // ---- networking -----------------------------------------------------
 
     pub fn connect(&mut self, host: &str, port: u16) {
-        if self.conn.is_some() {
+        if self.s().conn.is_some() {
             self.info("already connected — #zap first");
             return;
         }
         self.info(&format!("trying {}:{} ...", host, port));
-        self.conn_id += 1;
-        match net::connect_tcp(host, port, self.conn_id, self.tx.clone()) {
+        self.next_conn_id += 1;
+        let id = self.next_conn_id;
+        self.s_mut().conn_id = id;
+        match net::connect_tcp(host, port, id, self.tx.clone()) {
             Ok(conn) => self.finish_connect(
                 conn,
                 host,
@@ -489,13 +551,15 @@ impl App {
     }
 
     pub fn connect_tls(&mut self, host: &str, port: u16) {
-        if self.conn.is_some() {
+        if self.s().conn.is_some() {
             self.info("already connected — #zap first");
             return;
         }
         self.info(&format!("trying {}:{} (tls) ...", host, port));
-        self.conn_id += 1;
-        match net::connect_tls(host, port, self.conn_id, self.tx.clone()) {
+        self.next_conn_id += 1;
+        let id = self.next_conn_id;
+        self.s_mut().conn_id = id;
+        match net::connect_tls(host, port, id, self.tx.clone()) {
             Ok((conn, pin)) => {
                 match pin {
                     Pin::New(fp) => {
@@ -528,13 +592,15 @@ impl App {
     }
 
     fn start_pipe(&mut self, label: &str, command: &str, ssh_dest: Option<&str>) {
-        if self.conn.is_some() {
+        if self.s().conn.is_some() {
             self.info("already connected — #zap first");
             return;
         }
         self.info(&format!("running {} ...", command));
-        self.conn_id += 1;
-        match net::connect_pipe(command, ssh_dest, self.conn_id, self.tx.clone()) {
+        self.next_conn_id += 1;
+        let id = self.next_conn_id;
+        self.s_mut().conn_id = id;
+        match net::connect_pipe(command, ssh_dest, id, self.tx.clone()) {
             Ok(conn) => self.finish_connect(
                 conn,
                 label,
@@ -551,24 +617,24 @@ impl App {
 
     fn finish_connect(&mut self, conn: Conn, host: &str, port: u16, how: Recipe) {
         let kind = conn.kind();
-        self.conn = Some(conn);
+        self.s_mut().conn = Some(conn);
         // Remember how we got here before anything can go wrong with it, and
         // treat arriving as proof the backoff has done its job.
-        self.last_session = Some(how);
-        self.retry_at = None;
-        self.retry_n = 0;
+        self.s_mut().recipe = Some(how);
+        self.s_mut().retry_at = None;
+        self.s_mut().retry_n = 0;
         // A connection that has not spoken yet may still be negotiating. Hold
         // player text until it has, so the first thing judytin says is not sent
         // over the top of the first thing it was told.
         let cap = Instant::now() + Self::SETTLE;
-        self.settling = Some(cap);
-        self.settle_cap = Some(cap);
-        self.held.clear();
-        self.host = host.to_string();
-        self.port = port;
-        self.telnet = Telnet::new();
-        self.line_buf.clear();
-        self.line_written = 0;
+        self.s_mut().settling = Some(cap);
+        self.s_mut().settle_cap = Some(cap);
+        self.s_mut().held.clear();
+        self.s_mut().host = host.to_string();
+        self.s_mut().port = port;
+        self.s_mut().telnet = Telnet::new();
+        self.s_mut().line_buf.clear();
+        self.s_mut().line_written = 0;
         if port > 0 {
             self.info(&format!("connected to {}:{} ({})", host, port, kind));
         } else {
@@ -586,8 +652,75 @@ impl App {
         );
     }
 
-    pub fn connected(&self) -> bool {
-        self.conn.is_some()
+    /// Make `name` the session that typing goes to, creating nothing.
+    /// Returns false if there is no such session.
+    pub(crate) fn switch_to(&mut self, name: &str) -> bool {
+        match self.sessions.iter().position(|x| x.name == name) {
+            Some(i) => {
+                self.cur = i;
+                self.update_status();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Get a session ready to connect under `name`, and focus it.
+    ///
+    /// Reuses the current one when it is the unnamed starting session and
+    /// idle, so `judytin --offline` followed by `#session {mud} …` gives one
+    /// session rather than a named one beside a leftover blank.
+    pub(crate) fn open_session(&mut self, name: &str) -> bool {
+        if let Some(i) = self.sessions.iter().position(|x| x.name == name) {
+            if self.sessions[i].conn.is_some() {
+                let msg = format!("session {} is already connected — #zap it first", name);
+                self.info(&msg);
+                return false;
+            }
+            self.cur = i;
+            return true;
+        }
+        if self.s().name.is_empty() && self.s().conn.is_none() {
+            self.s_mut().name = name.to_string();
+            return true;
+        }
+        self.sessions.push(Session::new(name));
+        self.cur = self.sessions.len() - 1;
+        true
+    }
+
+    /// Close the current session and hand the focus to another if there is
+    /// one.
+    ///
+    /// The last session is disconnected but kept, name and recipe intact, so
+    /// `#zap` followed by `#reconnect` still works — which is what it did
+    /// before judytin could hold more than one session, and there is no reason
+    /// for that to change just because the count can now exceed one.
+    pub(crate) fn close_session(&mut self) {
+        self.disconnect(false);
+        if self.sessions.len() > 1 {
+            let gone = self.sessions.remove(self.cur);
+            self.cur = self.cur.min(self.sessions.len() - 1);
+            let now = self.s().label().to_string();
+            self.info(&format!("closed {} — now on {}", gone.label(), now));
+        }
+        self.update_status();
+    }
+
+    /// The session typing goes to. Always exists — see `sessions`.
+    pub(crate) fn s(&self) -> &Session {
+        &self.sessions[self.cur]
+    }
+
+    pub(crate) fn s_mut(&mut self) -> &mut Session {
+        &mut self.sessions[self.cur]
+    }
+
+    /// Find a session by the id its connection was opened with. Returns the
+    /// index so the caller can tell whether it is the current one, which is
+    /// what decides whether its output gets a name in front of it.
+    fn session_of(&self, conn_id: u64) -> Option<usize> {
+        self.sessions.iter().position(|x| x.conn_id == conn_id)
     }
 
     /// How long to wait before attempt `n`. Grows to half a minute and stays
@@ -610,11 +743,11 @@ impl App {
     /// some arbitrary count would abandon them at the moment a long rebuild
     /// finishes. `#zap` ends it, and every attempt says so.
     pub(crate) fn arm_reconnect(&mut self) {
-        if !self.reconnect_on || self.last_session.is_none() {
+        if !self.reconnect_on || self.s().recipe.is_none() {
             return;
         }
-        let wait = Self::backoff(self.retry_n);
-        self.retry_at = Some(Instant::now() + wait);
+        let wait = Self::backoff(self.s().retry_n);
+        self.s_mut().retry_at = Some(Instant::now() + wait);
         self.info(&format!(
             "reconnecting in {}s — #zap to stop",
             wait.as_secs()
@@ -625,10 +758,10 @@ impl App {
     /// Sending it to whatever comes next would put the player's words in a
     /// place they never chose.
     pub(crate) fn drop_held(&mut self) {
-        self.settling = None;
-        self.settle_cap = None;
-        let n = self.held.len();
-        self.held.clear();
+        self.s_mut().settling = None;
+        self.s_mut().settle_cap = None;
+        let n = self.s().held.len();
+        self.s_mut().held.clear();
         if n > 0 {
             self.info(&format!(
                 "{} unsent line{} dropped with the connection",
@@ -639,25 +772,25 @@ impl App {
     }
 
     pub(crate) fn cancel_reconnect(&mut self) {
-        self.retry_at = None;
-        self.retry_n = 0;
+        self.s_mut().retry_at = None;
+        self.s_mut().retry_n = 0;
     }
 
     /// Try the stored recipe once. `manual` is #reconnect, which runs whatever
     /// the config says and does not schedule a follow-up; the automatic path
     /// arms the next attempt when this one does not take.
     pub(crate) fn reconnect(&mut self, manual: bool) {
-        let Some(how) = self.last_session.clone() else {
+        let Some(how) = self.s().recipe.clone() else {
             self.info("no session to return to — #session, #ssl or #run first");
             return;
         };
-        if self.conn.is_some() {
+        if self.s().conn.is_some() {
             self.info("already connected — #zap first");
             return;
         }
-        self.retry_at = None;
+        self.s_mut().retry_at = None;
         if !manual {
-            self.retry_n = self.retry_n.saturating_add(1);
+            self.s_mut().retry_n = self.s_mut().retry_n.saturating_add(1);
         }
         match how {
             Recipe::Tcp { host, port } => self.connect(&host, port),
@@ -666,7 +799,7 @@ impl App {
                 self.start_pipe(&label, &command, ssh.as_deref())
             }
         }
-        if self.conn.is_none() && !manual {
+        if self.s().conn.is_none() && !manual {
             self.arm_reconnect();
         }
     }
@@ -676,12 +809,12 @@ impl App {
         // wanted, and this is the only signal judytin gets that says so.
         self.cancel_reconnect();
         self.drop_held();
-        if let Some(mut conn) = self.conn.take() {
+        if let Some(mut conn) = self.s_mut().conn.take() {
             conn.shutdown();
             if !quiet {
                 self.info("connection closed (zap)");
             }
-            let (host, port) = (self.host.clone(), self.port.to_string());
+            let (host, port) = (self.s().host.clone(), self.s().port.to_string());
             self.fire_event(
                 "SESSION DISCONNECTED",
                 &["judytin".to_string(), host.clone(), host, port],
@@ -693,7 +826,7 @@ impl App {
     }
 
     fn send_raw(&mut self, bytes: &[u8]) {
-        if let Some(conn) = &mut self.conn
+        if let Some(conn) = &mut self.s_mut().conn
             && conn.send(bytes).is_err()
         {
             self.info("send failed — connection lost");
@@ -717,9 +850,9 @@ impl App {
 
     /// Stop holding player text, and send whatever piled up, in order.
     fn release_held(&mut self) {
-        self.settling = None;
-        self.settle_cap = None;
-        while let Some(line) = self.held.pop_front() {
+        self.s_mut().settling = None;
+        self.s_mut().settle_cap = None;
+        while let Some(line) = self.s_mut().held.pop_front() {
             self.send_now(&line);
         }
     }
@@ -728,7 +861,7 @@ impl App {
     /// here, on its way out of the client's grammar for good.
     pub fn send_line(&mut self, line: &str) {
         let line = &crate::data::unescape(line);
-        if self.conn.is_none() {
+        if self.s().conn.is_none() {
             self.info(&format!("not connected — cannot send '{}'. try #session", line));
             return;
         }
@@ -737,8 +870,8 @@ impl App {
         // dialogue before the first prompt lands. Queue instead; the server's
         // first byte, or SETTLE, lets it go. Telnet replies do not come through
         // here, so an option is still answered the instant it is offered.
-        if self.settling.is_some() {
-            self.held.push_back(line.to_string());
+        if self.s().settling.is_some() {
+            self.s_mut().held.push_back(line.to_string());
             return;
         }
         self.send_now(line);
@@ -786,7 +919,7 @@ impl App {
             }
             Ev::Line(line) => self.handle_user_line(&line),
             Ev::StdinEof => {
-                if self.conn.is_none() {
+                if self.s().conn.is_none() {
                     self.quit = true;
                 } else {
                     // Staying is deliberate — it is how `printf 'look\n' |
@@ -800,44 +933,75 @@ impl App {
                 }
             }
             Ev::Net(id, bytes) => {
-                if id == self.conn_id {
-                    self.on_net_data(&bytes);
+                if let Some(i) = self.session_of(id) {
+                    self.on_session(i, |a| a.on_net_data(&bytes));
                 }
             }
             Ev::NetDiag(id, note) => {
-                if id == self.conn_id {
-                    self.info(&note);
+                if let Some(i) = self.session_of(id) {
+                    self.on_session(i, |a| a.info(&note));
                 }
             }
             Ev::NetClosed(id, why) => {
-                if id == self.conn_id && self.conn.is_some() {
-                    self.conn = None;
-                    self.drop_held();
-                    self.flush_partial();
-                    if !self.line_buf.is_empty() {
-                        self.output("\r\n");
-                        self.line_buf.clear();
-                        self.line_written = 0;
-                    }
-                    self.info(&why);
-                    self.update_status();
-                    let (host, port) = (self.host.clone(), self.port.to_string());
-                    self.fire_event(
-                        "SESSION DISCONNECTED",
-                        &["judytin".to_string(), host.clone(), host, port],
-                    );
-                    // The socket went away without judytin asking. This is the
-                    // case worth chasing — and the one judytin cannot tell from
-                    // the player typing the game's own quit, so it only chases
-                    // when asked to.
-                    self.arm_reconnect();
-                    // A piped run ends when the connection does, because there
-                    // is nothing left to type. Unless a retry is pending: then
-                    // there is, and the player said so.
-                    if matches!(self.ui, Ui::Dumb) && self.retry_at.is_none() {
-                        self.quit = true;
-                    }
+                if let Some(i) = self.session_of(id) {
+                    self.on_session(i, |a| a.on_net_closed(&why));
                 }
+            }
+        }
+    }
+
+    /// Handle something that happened to session `i`.
+    ///
+    /// The whole pipeline below — telnet, line assembly, triggers, output —
+    /// reads and writes "the current session". Threading an index through all
+    /// of it would touch every layer for no gain, so the focus moves instead.
+    /// That is also the right answer for triggers: one firing on a background
+    /// line replies to the session that produced the line, not to whichever
+    /// the player happens to be watching.
+    fn on_session<R>(&mut self, i: usize, f: impl FnOnce(&mut Self) -> R) -> R {
+        let back_to = self.s().name.clone();
+        let watching = self.cur;
+        self.cur = i;
+        self.bg = (i != watching).then(|| self.sessions[i].label().to_string());
+        let out = f(self);
+        self.bg = None;
+        // A #session inside a trigger is the player's own choice and outranks
+        // putting the focus back; only restore if nothing moved it.
+        if self.cur == i
+            && let Some(j) = self.sessions.iter().position(|x| x.name == back_to)
+        {
+            self.cur = j;
+        }
+        out
+    }
+
+    fn on_net_closed(&mut self, why: &str) {
+        if self.s().conn.is_some() {
+            self.s_mut().conn = None;
+            self.drop_held();
+            self.flush_partial();
+            if !self.s().line_buf.is_empty() {
+                self.output("\r\n");
+                self.s_mut().line_buf.clear();
+                self.s_mut().line_written = 0;
+            }
+            self.info(why);
+            self.update_status();
+            let (host, port) = (self.s().host.clone(), self.s().port.to_string());
+            self.fire_event(
+                "SESSION DISCONNECTED",
+                &["judytin".to_string(), host.clone(), host, port],
+            );
+            // The socket went away without judytin asking. This is the
+            // case worth chasing — and the one judytin cannot tell from
+            // the player typing the game's own quit, so it only chases
+            // when asked to.
+            self.arm_reconnect();
+            // A piped run ends when the connection does, because there
+            // is nothing left to type. Unless a retry is pending: then
+            // there is, and the player said so.
+            if matches!(self.ui, Ui::Dumb) && self.s().retry_at.is_none() {
+                self.quit = true;
             }
         }
     }
@@ -907,7 +1071,15 @@ impl App {
     pub fn next_deadline(&self) -> Option<Instant> {
         let tick = self.tickers.values().map(|t| t.next).min();
         let delay = self.delays.values().map(|t| t.next).min();
-        [tick, delay, self.flush_deadline, self.retry_at, self.settling]
+        // Every session's clocks, not just the one being watched: a background
+        // session's retry is exactly the thing that must go off unattended.
+        let sessions = self
+            .sessions
+            .iter()
+            .flat_map(|x| [x.retry_at, x.settling])
+            .flatten()
+            .min();
+        [tick, delay, self.flush_deadline, sessions]
             .into_iter()
             .flatten()
             .min()
@@ -921,18 +1093,19 @@ impl App {
         {
             self.flush_partial();
         }
-        if let Some(d) = self.settling
-            && d <= Instant::now()
-        {
-            // Either the greeting is over or the server never had one. Waiting
-            // further would look like judytin ignoring what was typed, which is
-            // worse than sending it a moment late.
-            self.release_held();
-        }
-        if let Some(d) = self.retry_at
-            && d <= Instant::now()
-        {
-            self.reconnect(false);
+        let now = Instant::now();
+        // Each session's own clocks, run in its own focus so a retry reconnects
+        // the session it belongs to rather than the one being watched.
+        for i in 0..self.sessions.len() {
+            if self.sessions[i].settling.is_some_and(|d| d <= now) {
+                // Either the greeting is over or the server never had one.
+                // Waiting further would look like judytin ignoring what was
+                // typed, which is worse than sending it a moment late.
+                self.on_session(i, |a| a.release_held());
+            }
+            if self.sessions[i].retry_at.is_some_and(|d| d <= now) {
+                self.on_session(i, |a| a.reconnect(false));
+            }
         }
         let now = Instant::now();
         let due: Vec<(String, String, bool)> = self
@@ -973,21 +1146,22 @@ impl App {
     // ---- server output pipeline ----------------------------------------
 
     fn on_net_data(&mut self, bytes: &[u8]) {
-        let (data, reply) = self.telnet.feed(bytes);
+        let (data, reply) = self.s_mut().telnet.feed(bytes);
         if !reply.is_empty() {
             self.send_raw(&reply);
         }
         // The server is still opening. Wait for it to pause rather than taking
         // the first packet as the whole greeting.
-        if self.settling.is_some() {
+        if self.s().settling.is_some() {
             let next = Instant::now() + Self::QUIET;
-            self.settling = match self.settle_cap {
+            self.s_mut().settling = match self.s_mut().settle_cap {
                 Some(cap) if cap < next => Some(cap),
                 _ => Some(next),
             };
         }
+        let masked = self.s().telnet.server_echo;
         if let Ui::Split(ui) = &mut self.ui {
-            ui.masked = self.telnet.server_echo;
+            ui.masked = masked;
         }
         // Decode across packet boundaries, not per packet: a multi-byte
         // character split by TCP would otherwise arrive as two replacement
@@ -1030,11 +1204,11 @@ impl App {
                 '\n' => self.complete_line(),
                 '\r' => {}
                 _ => {
-                    self.line_buf.push(c);
+                    self.s_mut().line_buf.push(c);
                     // A server that never sends a newline must not be able
                     // to grow this without limit, nor hand the pattern
                     // matcher a line long enough to freeze the client.
-                    if self.line_buf.len() >= MAX_LINE {
+                    if self.s().line_buf.len() >= MAX_LINE {
                         self.complete_line();
                     }
                 }
@@ -1043,7 +1217,7 @@ impl App {
         // Unterminated tail (usually the prompt): hold it briefly so a reply
         // that continues the line still gets full trigger processing, then
         // display it via tick().
-        self.flush_deadline = if self.line_buf.len() > self.line_written {
+        self.flush_deadline = if self.s().line_buf.len() > self.s().line_written {
             Some(Instant::now() + self.packet_patch)
         } else {
             None
@@ -1054,19 +1228,19 @@ impl App {
     /// (usually the prompt). Shown raw; triggers run on line completion.
     fn flush_partial(&mut self) {
         self.flush_deadline = None;
-        if self.line_buf.len() > self.line_written {
-            let frag = self.line_buf[self.line_written..].to_string();
-            self.line_written = self.line_buf.len();
+        if self.s().line_buf.len() > self.s().line_written {
+            let frag = self.s().line_buf[self.s().line_written..].to_string();
+            self.s_mut().line_written = self.s_mut().line_buf.len();
             self.output(&frag);
-            let full = self.line_buf.clone();
+            let full = self.s().line_buf.clone();
             let (plain, _) = strip_map(&full);
             self.fire_event("RECEIVED PROMPT", &[full, plain]);
         }
     }
 
     fn complete_line(&mut self) {
-        let raw = std::mem::take(&mut self.line_buf);
-        let written = std::mem::take(&mut self.line_written);
+        let raw = std::mem::take(&mut self.s_mut().line_buf);
+        let written = std::mem::take(&mut self.s_mut().line_written);
         let (plain, _) = strip_map(&raw);
 
         // Collect matching action bodies (and count down multishots).
@@ -1214,13 +1388,13 @@ impl App {
             }
         }
         self.flush_partial();
-        if self.echo_on && matches!(self.ui, Ui::Split(_)) && !self.telnet.server_echo {
+        if self.echo_on && matches!(self.ui, Ui::Split(_)) && !self.s().telnet.server_echo {
             // the echo lands right after any dangling prompt, closing its line
             self.output(&format!("\x1b[2m{}\x1b[0m\r\n", line));
-            self.line_buf.clear();
-            self.line_written = 0;
+            self.s_mut().line_buf.clear();
+            self.s_mut().line_written = 0;
         }
-        if matches!(self.ui, Ui::Dumb) && !self.telnet.server_echo {
+        if matches!(self.ui, Ui::Dumb) && !self.s().telnet.server_echo {
             // Not while the server has taken ECHO: that is a password
             // prompt, and this echo would put it on screen and in the log.
             let mut msg = String::from("\x1b[2m>> ");
