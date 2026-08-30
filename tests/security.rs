@@ -277,6 +277,33 @@ fn a_trigger_cannot_make_reconnect_respawn_a_process() {
 }
 
 #[test]
+fn a_trigger_cannot_spawn_a_process_by_spelling_run_differently() {
+    // `#session {name} {ssh://you@host}` opens the same thing `#run` opens: a
+    // program on this machine, with the mud on the far end of its pipe. The
+    // gate is about the act, not the word, so giving `#session` a second way
+    // to spell it must not give a trigger a way around the gate.
+    //
+    // A regression the moment `ssh://` was added, and the reason the pipe
+    // check lives on the single path every opening command goes through.
+    let port = hostile_server(vec!["spawn now\r\n".to_string()]);
+    let out = run(
+        port,
+        "#action {spawn now} {#session {probe} {ssh://nobody@127.0.0.1:1}}\n\
+         #delay {2} {#end}\n",
+    );
+    assert!(
+        !out.did("running ssh"),
+        "PROCESS SPAWNED BY THE SERVER: a trigger opened an ssh:// session:\n{}",
+        out.stdout
+    );
+    assert!(
+        out.says("refused"),
+        "expected the gate to say why it refused:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
 fn a_trigger_may_still_reopen_a_socket() {
     // The gate is about touching the machine, not about reconnecting. A socket
     // session costs the server only the connection it just dropped, so a
