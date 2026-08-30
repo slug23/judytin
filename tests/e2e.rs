@@ -264,6 +264,104 @@ fn spawn_restarting_mock(
 }
 
 #[test]
+fn player_text_waits_for_the_servers_opening() {
+    // The live shape of this: `printf 'guest x\nlook\nquit\n' | judytin` used
+    // to flush all three lines before judymud's banner arrived, so a login
+    // dialogue got answered blind. Here the server takes its time greeting, and
+    // the first thing it must read is still the first thing that was typed —
+    // not because the timing worked out, but because judytin waited.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let got: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let g2 = got.clone();
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        // A slow, split greeting: the worst case for anything that releases on
+        // the first packet it happens to see.
+        std::thread::sleep(Duration::from_millis(150));
+        let _ = sock.write_all(b"Welcome, slowly\r\n");
+        std::thread::sleep(Duration::from_millis(120));
+        let _ = sock.write_all(&[255, 251, 86]); // IAC WILL MCCP2, late
+        let _ = sock.write_all(b"By what name?\r\n> ");
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(1500)));
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = sock.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            g2.lock().unwrap().extend_from_slice(&buf[..n]);
+            if g2.lock().unwrap().windows(4).any(|w| w == b"quit") {
+                break;
+            }
+        }
+    });
+    run_judytin_with(
+        &["--dumb", "127.0.0.1", &port.to_string()],
+        "myname\nquit\n",
+        &[],
+    );
+    server.join().unwrap();
+    let recv = got.lock().unwrap().clone();
+    let dont = recv.windows(3).position(|w| w == [255u8, 254, 86]);
+    let name = recv
+        .windows(6)
+        .position(|w| w == b"myname")
+        .expect("the typed line never arrived");
+    let dont = dont.expect("the client never refused the option");
+    assert!(
+        dont < name,
+        "player text overtook the option refusal: {:?}",
+        String::from_utf8_lossy(&recv)
+    );
+}
+
+#[test]
+fn a_silent_server_does_not_swallow_what_was_typed() {
+    // The hold is a courtesy, not a gate. A server that says nothing at all
+    // must not leave the player's input stuck behind it forever.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let got: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let g2 = got.clone();
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        // Not one byte of greeting.
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(4000)));
+        // One read is the whole question: did anything arrive at all?
+        let mut buf = [0u8; 1024];
+        if let Ok(n) = sock.read(&mut buf)
+            && n > 0
+        {
+            g2.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
+    run_judytin_with(
+        &["--dumb", "127.0.0.1", &port.to_string()],
+        "hello anybody\n#delay {4} {#end}\n",
+        &[],
+    );
+    server.join().unwrap();
+    let recv = String::from_utf8_lossy(&got.lock().unwrap().clone()).into_owned();
+    assert!(
+        recv.contains("hello anybody"),
+        "the backstop never fired; input was swallowed: {:?}",
+        recv
+    );
+}
+
+#[test]
+fn input_ending_while_connected_says_so_instead_of_going_quiet() {
+    let (port, _count, server) = spawn_restarting_mock(1, Duration::from_millis(2500));
+    let out = run_judytin_with(&["--dumb", "127.0.0.1", &port.to_string()], "look\n", &[]);
+    server.join().unwrap();
+    assert!(
+        out.contains("input ended, still connected"),
+        "a script that forgot #end just hangs with nothing said:\n{}",
+        out
+    );
+}
+
+#[test]
 fn a_dropped_session_is_not_chased_unless_asked() {
     let (port, count, server) = spawn_restarting_mock(1, Duration::from_millis(300));
     let out = run_judytin_with(&["--dumb", "127.0.0.1", &port.to_string()], "#config\n", &[]);
@@ -464,22 +562,10 @@ fn dumb_mode_against_mock_mud() {
                     }
                     if text == "quit" {
                         sock.write_all(b"Goodbye.\r\n").unwrap();
-                        // Drain before hanging up. judytin answers the telnet
-                        // offer from its event loop, and when stdin is a pipe it
-                        // can flush all four typed lines before it reaches the
-                        // queued network read — so the refusal legitimately
-                        // arrives just after `quit`. The assertion below is about
-                        // the whole session, not about which of the two won a
-                        // startup race, and slamming the socket shut here is what
-                        // made this test fail at random.
-                        let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
-                        let mut sink = [0u8; 1024];
-                        while let Ok(n) = sock.read(&mut sink) {
-                            if n == 0 {
-                                break;
-                            }
-                            received_srv.lock().unwrap().extend_from_slice(&sink[..n]);
-                        }
+                        // No drain needed: judytin holds player text until the
+                        // server's opening is over, so the refusal is already
+                        // here. This closing the socket immediately is the point
+                        // — it is what the old ordering could not survive.
                         break 'outer;
                     }
                     sock.write_all(b"> ").unwrap();

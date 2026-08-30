@@ -51,7 +51,8 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" => {
                 println!(
                     "judytin {} — a tiny TinTin++ for judymud\n\n\
-                     usage: judytin [options] [host] [port]\n\n\
+                     usage: judytin [options] [host] [port]\n\
+                     \x20        judytin [options] [port]\n\n\
                      defaults to {}:{} (judymud's telnet door)\n\n\
                      options:\n\
                      \x20 -r <file>       read a script file at startup (repeatable)\n\
@@ -92,6 +93,16 @@ fn parse_args() -> Result<Args, String> {
             }
             other => positional.push(other.to_string()),
         }
+    }
+    // A lone number is a port, not a host. Read as a host it becomes an
+    // integer IPv4 address — 4000 is 0.0.15.160 — so judytin would go looking
+    // for a machine nobody meant, and say "no route to host" about a number
+    // the player typed as a port.
+    if positional.len() == 1
+        && let Some(p) = positional[0].parse::<u16>().ok().filter(|p| *p > 0)
+    {
+        args.port = Some(p);
+        positional.clear();
     }
     if let Some(h) = positional.first() {
         args.host = h.clone();
@@ -208,5 +219,49 @@ fn main() {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
         app.tick();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The parse under test, lifted out of `parse_args` so it can be run on a
+    /// list instead of the real command line.
+    fn split(positional: &[&str]) -> (Option<String>, Option<u16>) {
+        let mut host = None;
+        let mut port = None;
+        let mut rest: Vec<&str> = positional.to_vec();
+        if rest.len() == 1
+            && let Some(p) = rest[0].parse::<u16>().ok().filter(|p| *p > 0)
+        {
+            port = Some(p);
+            rest.clear();
+        }
+        if let Some(h) = rest.first() {
+            host = Some(h.to_string());
+        }
+        if let Some(p) = rest.get(1) {
+            port = p.parse().ok();
+        }
+        (host, port)
+    }
+
+    #[test]
+    fn a_lone_number_is_a_port_not_a_host() {
+        // Read as a host, 4000 resolves as an integer IPv4 address and judytin
+        // goes looking for a machine nobody meant.
+        assert_eq!(split(&["4000"]), (None, Some(4000)));
+        assert_eq!(split(&["2323"]), (None, Some(2323)));
+    }
+
+    #[test]
+    fn a_name_is_still_a_name_and_a_pair_is_still_a_pair() {
+        assert_eq!(split(&["mud.example.org"]), (Some("mud.example.org".into()), None));
+        assert_eq!(
+            split(&["mud.example.org", "4000"]),
+            (Some("mud.example.org".into()), Some(4000))
+        );
+        // Out of port range, so it stays a host — which is how the integer form
+        // of an IPv4 address keeps working.
+        assert_eq!(split(&["2130706433"]), (Some("2130706433".into()), None));
     }
 }

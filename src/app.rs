@@ -147,6 +147,15 @@ pub struct App {
     retry_at: Option<Instant>,
     /// Attempts since the last success, which is what stretches the backoff.
     retry_n: u32,
+    /// When held text may go. Pushed back by each thing the server says, so
+    /// the release lands after its opening burst rather than in the middle of
+    /// one — see `send_line`.
+    settling: Option<Instant>,
+    /// The furthest that pushing back may reach, so a chatty server cannot
+    /// hold the player's input open indefinitely.
+    settle_cap: Option<Instant>,
+    /// Player lines waiting for that opening.
+    held: std::collections::VecDeque<String>,
     pub(crate) host: String,
     pub(crate) port: u16,
     telnet: Telnet,
@@ -227,6 +236,9 @@ impl App {
             reconnect_on: false,
             retry_at: None,
             retry_n: 0,
+            settling: None,
+            settle_cap: None,
+            held: std::collections::VecDeque::new(),
             host: String::new(),
             port: 0,
             telnet: Telnet::new(),
@@ -545,6 +557,13 @@ impl App {
         self.last_session = Some(how);
         self.retry_at = None;
         self.retry_n = 0;
+        // A connection that has not spoken yet may still be negotiating. Hold
+        // player text until it has, so the first thing judytin says is not sent
+        // over the top of the first thing it was told.
+        let cap = Instant::now() + Self::SETTLE;
+        self.settling = Some(cap);
+        self.settle_cap = Some(cap);
+        self.held.clear();
         self.host = host.to_string();
         self.port = port;
         self.telnet = Telnet::new();
@@ -602,6 +621,23 @@ impl App {
         ));
     }
 
+    /// Throw away queued text when the connection it was meant for is gone.
+    /// Sending it to whatever comes next would put the player's words in a
+    /// place they never chose.
+    pub(crate) fn drop_held(&mut self) {
+        self.settling = None;
+        self.settle_cap = None;
+        let n = self.held.len();
+        self.held.clear();
+        if n > 0 {
+            self.info(&format!(
+                "{} unsent line{} dropped with the connection",
+                n,
+                if n == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
     pub(crate) fn cancel_reconnect(&mut self) {
         self.retry_at = None;
         self.retry_n = 0;
@@ -639,6 +675,7 @@ impl App {
         // The player asked to leave. Whatever retry was pending is no longer
         // wanted, and this is the only signal judytin gets that says so.
         self.cancel_reconnect();
+        self.drop_held();
         if let Some(mut conn) = self.conn.take() {
             conn.shutdown();
             if !quiet {
@@ -667,6 +704,26 @@ impl App {
         }
     }
 
+    /// How long a new connection gets to say something before judytin gives up
+    /// waiting and sends anyway. Only a backstop: a server that greets you —
+    /// which is nearly all of them — releases the hold in milliseconds.
+    const SETTLE: Duration = Duration::from_secs(2);
+
+    /// How long the server must stay quiet before its opening counts as over.
+    /// A greeting is written back to back but need not arrive in one packet:
+    /// releasing on the first byte can land between a banner and the option
+    /// negotiation behind it, which is the whole thing being avoided.
+    const QUIET: Duration = Duration::from_millis(250);
+
+    /// Stop holding player text, and send whatever piled up, in order.
+    fn release_held(&mut self) {
+        self.settling = None;
+        self.settle_cap = None;
+        while let Some(line) = self.held.pop_front() {
+            self.send_now(&line);
+        }
+    }
+
     /// Send one line to the MUD. A sink: escaped data becomes plain text
     /// here, on its way out of the client's grammar for good.
     pub fn send_line(&mut self, line: &str) {
@@ -675,6 +732,19 @@ impl App {
             self.info(&format!("not connected — cannot send '{}'. try #session", line));
             return;
         }
+        // A connection that has not spoken yet may be mid-negotiation, and with
+        // input arriving from a pipe judytin can otherwise flush a whole login
+        // dialogue before the first prompt lands. Queue instead; the server's
+        // first byte, or SETTLE, lets it go. Telnet replies do not come through
+        // here, so an option is still answered the instant it is offered.
+        if self.settling.is_some() {
+            self.held.push_back(line.to_string());
+            return;
+        }
+        self.send_now(line);
+    }
+
+    fn send_now(&mut self, line: &str) {
         if self.path_mapping
             && let Some(rev) = self.pathdirs.get(line).cloned()
         {
@@ -718,6 +788,15 @@ impl App {
             Ev::StdinEof => {
                 if self.conn.is_none() {
                     self.quit = true;
+                } else {
+                    // Staying is deliberate — it is how `printf 'look\n' |
+                    // judytin --dumb` watches what comes back. But saying
+                    // nothing turns a script that forgot `quit` into a
+                    // pipeline that hangs with no explanation anywhere.
+                    self.info(
+                        "input ended, still connected — watching the mud. \
+                         Send #end in the script, or interrupt, to stop.",
+                    );
                 }
             }
             Ev::Net(id, bytes) => {
@@ -733,6 +812,7 @@ impl App {
             Ev::NetClosed(id, why) => {
                 if id == self.conn_id && self.conn.is_some() {
                     self.conn = None;
+                    self.drop_held();
                     self.flush_partial();
                     if !self.line_buf.is_empty() {
                         self.output("\r\n");
@@ -827,7 +907,7 @@ impl App {
     pub fn next_deadline(&self) -> Option<Instant> {
         let tick = self.tickers.values().map(|t| t.next).min();
         let delay = self.delays.values().map(|t| t.next).min();
-        [tick, delay, self.flush_deadline, self.retry_at]
+        [tick, delay, self.flush_deadline, self.retry_at, self.settling]
             .into_iter()
             .flatten()
             .min()
@@ -840,6 +920,14 @@ impl App {
             && d <= Instant::now()
         {
             self.flush_partial();
+        }
+        if let Some(d) = self.settling
+            && d <= Instant::now()
+        {
+            // Either the greeting is over or the server never had one. Waiting
+            // further would look like judytin ignoring what was typed, which is
+            // worse than sending it a moment late.
+            self.release_held();
         }
         if let Some(d) = self.retry_at
             && d <= Instant::now()
@@ -888,6 +976,15 @@ impl App {
         let (data, reply) = self.telnet.feed(bytes);
         if !reply.is_empty() {
             self.send_raw(&reply);
+        }
+        // The server is still opening. Wait for it to pause rather than taking
+        // the first packet as the whole greeting.
+        if self.settling.is_some() {
+            let next = Instant::now() + Self::QUIET;
+            self.settling = match self.settle_cap {
+                Some(cap) if cap < next => Some(cap),
+                _ => Some(next),
+            };
         }
         if let Ui::Split(ui) = &mut self.ui {
             ui.masked = self.telnet.server_echo;

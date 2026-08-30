@@ -49,6 +49,17 @@ exists. `--offline` starts without connecting; `--dumb` gives a plain
 line-mode client (automatic when stdin/stdout is a pipe, which makes judytin
 scriptable: `printf 'guest x\nlook\nquit\n' | judytin --dumb`).
 
+That example works because judytin holds what you type until the server has
+finished greeting you — otherwise a pipe delivers all three lines before the
+login prompt has even arrived, and they get answered blind. The hold lasts
+until the server pauses, or two seconds if it never speaks at all, and it
+never delays judytin's own answer to a telnet option. When input runs out
+while a session is still open, judytin says so rather than sitting there
+looking hung.
+
+A lone number is read as a port, not a host: `judytin 4000` is the local
+default host on port 4000. Two arguments are still host then port.
+
 ## The tt++ dialect it speaks
 
 Commands start with `#` and may be abbreviated (`#al`, `#act`, `#high`, ...).
