@@ -419,6 +419,38 @@ fn switching_to_a_session_that_is_not_there_says_so() {
 }
 
 #[test]
+fn one_session_dropping_does_not_end_a_run_the_others_are_still_in() {
+    // A piped run ends when there is nothing left to wait for. That used to be
+    // read as "when a connection closes", which was the same thing while
+    // judytin held one session and stopped being the same thing the moment it
+    // could hold four: the first socket to go took the live ones with it.
+    //
+    // Found for real — a four-character party against judymud lost three
+    // healthy sessions nine seconds in because a fourth dropped.
+    let (pa, _ca, sa) = spawn_restarting_mock(1, Duration::from_millis(400));
+    let (pb, sb) = spawn_named_mock("beta");
+    let out = plain(&run_judytin_with(
+        &["--dumb", "--offline"],
+        &format!(
+            "#session {{a}} {{127.0.0.1:{pa}}}\n\
+             #delay {{0.4}} {{#session {{b}} {{127.0.0.1:{pb}}}}}\n\
+             #delay {{1.6}} {{poke}}\n\
+             #delay {{2.4}} {{#end}}\n"
+        ),
+        &[],
+    ));
+    sa.join().unwrap();
+    sb.join().unwrap();
+    assert!(out.contains("session 1 up"), "never reached the first mock:\n{}", out);
+    // The proof: b answered something typed a full second after a went away.
+    assert!(
+        out.contains("beta heard poke"),
+        "the run ended with the first socket, taking a live session with it:\n{}",
+        out
+    );
+}
+
+#[test]
 fn zapping_one_of_several_leaves_the_others_alone() {
     let (pa, sa) = spawn_named_mock("alpha");
     let (pb, sb) = spawn_named_mock("beta");

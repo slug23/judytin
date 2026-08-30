@@ -1154,10 +1154,16 @@ impl App {
             // the player typing the game's own quit, so it only chases
             // when asked to.
             self.arm_reconnect();
-            // A piped run ends when the connection does, because there
-            // is nothing left to type. Unless a retry is pending: then
-            // there is, and the player said so.
-            if matches!(self.ui, Ui::Dumb) && self.s().retry_at.is_none() {
+            // A piped run ends when there is nothing left to wait for: no
+            // session still connected, and none expecting to be. Asking only
+            // about the session that just closed was right when judytin held
+            // one, and wrong the moment it could hold four — the first socket
+            // to go would take the live ones with it.
+            let waiting = self
+                .sessions
+                .iter()
+                .any(|x| x.conn.is_some() || x.retry_at.is_some());
+            if matches!(self.ui, Ui::Dumb) && !waiting {
                 self.quit = true;
             }
         }
