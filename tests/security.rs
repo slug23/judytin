@@ -277,6 +277,27 @@ fn a_trigger_cannot_make_reconnect_respawn_a_process() {
 }
 
 #[test]
+fn running_something_in_every_session_does_not_launder_the_gate() {
+    // `#all` and `#name` put a command into another session's focus, which is
+    // a new layer between a trigger and what it runs. If the gate lived in the
+    // focus rather than in the execution, `#all {#system ...}` would be a way
+    // to step over it — and the same shape as the timer laundering above, so
+    // it is kept as a regression the moment the layer was added.
+    let m = marker("allgate");
+    let port = hostile_server(vec!["go now\r\n".to_string()]);
+    let out = run(
+        port,
+        &format!(
+            "#action {{go now}} {{#all {{#system touch {}}}}}\n\
+             #delay {{2}} {{#end}}\n",
+            m.display()
+        ),
+    );
+    assert_not_created(&m, "#all ran a shell command for a trigger");
+    assert!(out.says("refused"), "expected the gate to say why it refused:\n{}", out.stdout);
+}
+
+#[test]
 fn a_trigger_cannot_spawn_a_process_by_spelling_run_differently() {
     // `#session {name} {ssh://you@host}` opens the same thing `#run` opens: a
     // program on this machine, with the mud on the far end of its pipe. The

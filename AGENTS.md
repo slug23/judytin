@@ -68,7 +68,9 @@ Two, both explained where they live. Read them before touching parsing.
    exactly once.
 2. **Server-driven execution cannot touch the machine.** `#system`,
    `#run`, `#read`, `#write`, `#log` and `#textin` refuse when a trigger,
-   event, or a timer they created caused the execution.
+   event, or a timer they created caused the execution. So does `#session`
+   when its destination is an `ssh://` one: the gate is on the act of
+   spawning a process, not on which command spells it.
 
 `tests/security.rs` is a suite of hostile servers, one per attack, several
 of them regressions for bugs that were live. Run it after any change to

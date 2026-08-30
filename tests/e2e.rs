@@ -873,3 +873,313 @@ quit\n";
         "client sent a subnegotiation"
     );
 }
+
+// ---- more than one character, one client -------------------------------
+
+/// A hall several players share, with a party in it.
+///
+/// The rule that matters: the grue only dies once *every* member of the party
+/// has struck it. One connection doing everything cannot satisfy that, so a
+/// transcript in which the grue dies is evidence that three separate sessions
+/// really acted — not that one session's output was copied three times.
+#[derive(Default)]
+struct Hall {
+    seats: Vec<(String, std::net::TcpStream)>,
+    party: Vec<String>,
+    struck: Vec<String>,
+}
+
+impl Hall {
+    fn tell_all(&mut self, text: &str) {
+        let msg = format!("{}\r\n", text);
+        for (_, w) in self.seats.iter_mut() {
+            let _ = w.write_all(msg.as_bytes());
+        }
+    }
+}
+
+fn spawn_party_mud(players: usize) -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hall: Arc<Mutex<Hall>> = Arc::new(Mutex::new(Hall::default()));
+    let handle = std::thread::spawn(move || {
+        let mut threads = Vec::new();
+        for _ in 0..players {
+            let Ok((sock, _)) = listener.accept() else { break };
+            let hall = hall.clone();
+            threads.push(std::thread::spawn(move || serve_player(sock, hall)));
+        }
+        for t in threads {
+            let _ = t.join();
+        }
+    });
+    (port, handle)
+}
+
+fn serve_player(mut sock: std::net::TcpStream, hall: Arc<Mutex<Hall>>) {
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(9000)));
+    let _ = sock.write_all(b"The Hall of Mock.\r\nWhat is your name?\r\n");
+    let mut me = String::new();
+    let mut buf = [0u8; 1024];
+    let mut line = Vec::new();
+    let mut skip = 0usize;
+    loop {
+        let n = match sock.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        for &b in &buf[..n] {
+            // telnet negotiation, ignored the way the other mocks ignore it
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            if b == 255 {
+                skip = 2;
+                continue;
+            }
+            if b != b'\n' {
+                if b != b'\r' {
+                    line.push(b);
+                }
+                continue;
+            }
+            let text = String::from_utf8_lossy(&line).trim().to_string();
+            line.clear();
+            if text.is_empty() {
+                continue;
+            }
+            if me.is_empty() {
+                me = text;
+                let _ = sock.write_all(format!("You are {}.\r\n", me).as_bytes());
+                let seat = sock.try_clone().unwrap();
+                let mut h = hall.lock().unwrap();
+                h.tell_all(&format!("{} arrives.", me));
+                h.seats.push((me.clone(), seat));
+                continue;
+            }
+            if !obey(&me, &text, &hall) {
+                return;
+            }
+        }
+    }
+}
+
+/// One command from one player. Returns false when they have left.
+fn obey(me: &str, text: &str, hall: &Arc<Mutex<Hall>>) -> bool {
+    let (verb, arg) = match text.split_once(' ') {
+        Some((v, a)) => (v, a.trim()),
+        None => (text, ""),
+    };
+    let mut h = hall.lock().unwrap();
+    match verb {
+        "group" => {
+            if !h.party.iter().any(|p| p == me) {
+                h.party.push(me.to_string());
+            }
+            let roll = h.party.join(", ");
+            h.tell_all(&format!("{} joins the party. Party: {}", me, roll));
+        }
+        "pull" => h.tell_all("A grue lumbers out of the dark."),
+        "strike" => {
+            if !h.party.iter().any(|p| p == me) {
+                h.tell_all(&format!("{} swings alone and misses.", me));
+            } else {
+                if !h.struck.iter().any(|p| p == me) {
+                    h.struck.push(me.to_string());
+                }
+                h.tell_all(&format!("{} strikes the grue.", me));
+                if h.party.len() > 1 && h.party.iter().all(|p| h.struck.contains(p)) {
+                    h.tell_all("The grue dies. The party wins.");
+                }
+            }
+        }
+        "say" => h.tell_all(&format!("{} says '{}'", me, arg)),
+        "quit" => {
+            h.tell_all(&format!("{} leaves the hall.", me));
+            return false;
+        }
+        other => h.tell_all(&format!("{} does not know how to {}.", me, other)),
+    }
+    true
+}
+
+#[test]
+fn three_characters_on_three_sessions_group_up_and_play_as_one_party() {
+    // The whole point of holding several sessions, done end to end by one
+    // judytin: three characters log themselves in under three names, form a
+    // party, and kill something that cannot be killed alone.
+    //
+    // Every new piece of the syntax is load-bearing here. `$session` is how
+    // one login trigger serves three characters instead of three near-copies
+    // of the same trigger. `#all` is how a party acts together. `#grib pull`
+    // is how one character does something the others do not — without the
+    // switch-there-and-switch-back dance, which is also what makes the plain
+    // `say` two lines later still reach tuk.
+    // Each step waits for the server to confirm the one before it, rather than
+    // for a clock. Wall-clock chaining was measuring the machine: seven delays
+    // that each had to land after a round trip, and on a busy one they stopped
+    // landing. Nothing below races, and the only remaining delay is the
+    // backstop that stops the test hanging if a step never arrives.
+    let (port, mud) = spawn_party_mud(3);
+    let script = format!(
+        // `say still here` and `#session` go through a short #delay rather than
+        // straight into a trigger body. A trigger runs with the session that
+        // saw the line as the current one, which is right for `#all` and wrong
+        // for these two: they are meant to come from the foreground, and that
+        // is exactly what they are here to prove. A timer fires at the top
+        // level, so they do.
+        //
+        // Three logins, in whatever order the sockets happen to be ready.
+        // Counting them is what makes "everyone is in" a fact rather than a
+        // guess — keying on the last name opened would deadlock whenever that
+        // session logged in first.
+        "#variable {{in}} {{0}}\n\
+         #action {{What is your name}} {{$session}}\n\
+         #action {{You are %1.}} {{#math {{in}} {{$in + 1}};#if {{$in == 3}} {{#all {{group}}}}}}\n\
+         #line oneshot {{#action {{Party: %1, %2, %3}} {{#grib pull}}}}\n\
+         #line oneshot {{#action {{A grue lumbers}} {{#delay {{0.2}} {{say still here}}}}}}\n\
+         #line oneshot {{#action {{says 'still here'}} {{#all {{strike}}}}}}\n\
+         #line oneshot {{#action {{The grue dies}} \
+           {{#delay {{0.2}} {{#session}};#delay {{0.5}} {{#all {{quit}}}}}}}}\n\
+         #session {{grib}} {{127.0.0.1:{port}}}\n\
+         #session {{sam}} {{127.0.0.1:{port}}}\n\
+         #session {{tuk}} {{127.0.0.1:{port}}}\n\
+         #delay {{15}} {{#end}}\n"
+    );
+    let out = plain(&run_judytin_with(&["--dumb", "--offline"], &script, &[]));
+    let _ = mud.join();
+
+    // One trigger, three characters: each session answered with its own name.
+    for who in ["grib", "sam", "tuk"] {
+        assert!(
+            out.contains(&format!("You are {}.", who)),
+            "{} never logged in — $session did not follow the session:\n{}",
+            who,
+            out
+        );
+    }
+    // They are one party, and some roll call names all three. Not a fixed
+    // order: `#all` sends in session order, but three sockets reaching one
+    // server land in whatever order the server's threads get to them, and a
+    // test that insisted otherwise would be measuring the mock's scheduling.
+    let full_roll = out.lines().any(|l| {
+        l.contains("Party: ") && ["grib", "sam", "tuk"].iter().all(|w| l.contains(w))
+    });
+    assert!(full_roll, "#all did not reach every session:\n{}", out);
+    // Only one of them pulled, and it was the one addressed by name.
+    assert!(out.contains("A grue lumbers out of the dark."), "nobody pulled:\n{}", out);
+    // The kill needs every member to have struck, so this line is the proof.
+    assert!(
+        out.contains("The grue dies. The party wins."),
+        "the party did not all strike — #all missed a session:\n{}",
+        out
+    );
+    // #grib left the focus where it found it, so plain typing still went to
+    // tuk, the session opened last.
+    assert!(
+        out.contains("tuk says 'still here'"),
+        "addressing grib stole the focus from tuk:\n{}",
+        out
+    );
+    // ...and the other two heard it from the background, named.
+    assert!(
+        out.contains("[grib] tuk says 'still here'"),
+        "grib did not hear tuk in the background:\n{}",
+        out
+    );
+    // The listing agrees about who is who and where typing goes.
+    assert!(out.contains("* tuk"), "the listing lost the current session:\n{}", out);
+    assert!(out.contains("  grib"), "the listing lost grib:\n{}", out);
+}
+
+#[test]
+fn zapping_a_session_by_name_leaves_the_one_you_are_watching() {
+    // Closing a background session should not disturb the foreground one.
+    // Before #zap took a name this needed switching there and back, which is
+    // three commands to do one thing and leaves the focus somewhere else if
+    // anything in between goes wrong.
+    let (pa, sa) = spawn_named_mock("alpha");
+    let (pb, sb) = spawn_named_mock("beta");
+    let out = plain(&run_judytin_with(
+        &["--dumb", "--offline"],
+        &format!(
+            "#session {{a}} {{127.0.0.1:{pa}}}\n\
+             #delay {{0.5}} {{#session {{b}} {{127.0.0.1:{pb}}}}}\n\
+             #delay {{1.2}} {{#zap {{a}}}}\n\
+             #delay {{1.6}} {{poke}}\n\
+             #delay {{2.4}} {{#end}}\n"
+        ),
+        &[],
+    ));
+    let _ = sa.join();
+    let _ = sb.join();
+
+    assert!(out.contains("closed a — now on b"), "#zap {{a}} did not close a:\n{}", out);
+    // Typing still goes to b, which is where it was going before.
+    assert!(out.contains("beta heard poke"), "zapping a took b's focus with it:\n{}", out);
+    assert!(!out.contains("alpha heard poke"), "a was still connected:\n{}", out);
+}
+
+#[test]
+fn a_session_named_after_a_command_says_so_rather_than_going_unreachable() {
+    // Commands win over session names, so `#send` stays #send. A player who
+    // names a session `send` would otherwise find `#send hi` doing something
+    // else entirely, and only find out later.
+    let (port, mock) = spawn_named_mock("gamma");
+    let out = plain(&run_judytin_with(
+        &["--dumb", "--offline"],
+        &format!(
+            "#session {{send}} {{127.0.0.1:{port}}}\n\
+             #delay {{0.8}} {{#end}}\n"
+        ),
+        &[],
+    ));
+    let _ = mock.join();
+    assert!(
+        out.contains("#send is already a command"),
+        "opened a shadowed name without a word about it:\n{}",
+        out
+    );
+}
+
+#[test]
+fn a_destination_judytin_cannot_read_is_refused_before_anything_opens() {
+    let out = plain(&run_judytin_with(
+        &["--dumb", "--offline"],
+        "#session {a} {gopher://mudhost}\n\
+         #session {b} {mudhost:99999}\n\
+         #session\n\
+         #end\n",
+        &[],
+    ));
+    assert!(out.contains("not a transport judytin has"), "took a made-up scheme:\n{}", out);
+    assert!(out.contains("is not a port number"), "took a port that cannot exist:\n{}", out);
+    // Neither one left a session behind: the listing still has only the
+    // unnamed session judytin started with.
+    assert!(!out.contains(" a — "), "a bad destination still opened a session:\n{}", out);
+    assert!(!out.contains(" b — "), "a bad port still opened a session:\n{}", out);
+}
+
+#[test]
+fn the_session_nobody_named_can_still_be_addressed() {
+    // Connecting from the command line leaves a session with no name, which
+    // the listing writes as `-`. Opening a second one beside it must not
+    // strand the first: `-` is what a player reads there, so `-` is what
+    // addresses it.
+    let (pa, sa) = spawn_named_mock("alpha");
+    let (pb, sb) = spawn_named_mock("beta");
+    let out = plain(&run_judytin_with(
+        &["--dumb", "127.0.0.1", &pa.to_string()],
+        &format!(
+            "#session {{b}} {{127.0.0.1:{pb}}}\n\
+             #delay {{0.8}} {{#- poke}}\n\
+             #delay {{1.4}} {{#end}}\n"
+        ),
+        &[],
+    ));
+    let _ = sa.join();
+    let _ = sb.join();
+    assert!(out.contains("[-] alpha heard poke"), "`#-` did not reach it:\n{}", out);
+    assert!(!out.contains("beta heard poke"), "`#-` went to the wrong session:\n{}", out);
+}

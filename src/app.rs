@@ -783,6 +783,10 @@ impl App {
             .iter()
             .position(|x| x.name == name)
             .or_else(|| self.sessions.iter().position(|x| x.name.eq_ignore_ascii_case(name)))
+            // The session nobody named reads as `-` in the listing, so `-` is
+            // what someone will type to reach it. Last, so a session actually
+            // called `-` is still itself.
+            .or_else(|| self.sessions.iter().position(|x| x.label() == name))
     }
 
     /// Make `name` the session that typing goes to, creating nothing.

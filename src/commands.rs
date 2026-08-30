@@ -2136,12 +2136,14 @@ impl App {
   \x1b[1mlists\x1b[0m     #list {name} {create|add|clear|get|set|size|find} {args}\r
             #list {name} {insert|delete|sort|reverse|explode|collapse}\r
             items live in $name[1]..; $name[-1] is the last\r
-  \x1b[1msession\x1b[0m   #session {name} {host} {port} opens, #zap closes, #end quits\r
-            #session lists them, #session {name} switches between them\r
+  \x1b[1msession\x1b[0m   #session {name} {where} opens — {where} is host, host:port,\r
+            ssl://host or ssh://you@host (each door has its own default)\r
+            #session lists them, #session {name} switches, #zap {name} closes\r
+            #name {command} runs it there, #all {command} runs it everywhere\r
+            $session is the name of the session a command is running in\r
             #reconnect  return to the last session, whatever the transport\r
             #config {reconnect} {on}  keep retrying after a server-side drop\r
-            #ssl {name} {host} {port} telnet-over-TLS (pin kept in ~/.judytin_known_hosts)\r
-            #run {name} {ssh -T you@host} any command as the byte pipe\r
+            #ssl {name} {host} {port} and #run {name} {cmd} — tt++'s spellings\r
   \x1b[1mtriggers\x1b[0m  #alias #action #highlight #substitute #gag #variable #function\r
             #macro {f5} {...}  #event {SESSION CONNECTED} {...}  #tab {word}\r
             each has an #un... remover; bare command lists definitions\r

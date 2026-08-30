@@ -124,6 +124,7 @@ pattern matching on strings (`"{bli|bla}"`), `===` compares exactly.
 | `#path` / `#pathdir` | record routes, `walk` / `run {delay}` / `zip` to a speedwalk |
 | `#showme`, `#echo {fmt} {args}`, `#send`, `#cr`, `#bell`, `#split` | output & misc |
 | `#textin {file}`, `#system {cmd}`, `#read` / `#write {file}` | files & shell |
+| `#session`, `#zap {name}`, `#name {cmd}`, `#all {cmd}`, `$session` | several muds at once |
 
 `#help` shows the in-client cheat sheet, `#commands` lists every command.
 `ctrl-d` on an empty line quits, `ctrl-l` redraws, up/down browse history,
@@ -167,13 +168,35 @@ judytin holds several connections at once and sends what you type to one of
 them.
 
 ```
-#session {mud} {127.0.0.1} {2323}   open one, named
-#ssl {secure} {mudhost} {2324}      or over TLS
-#run {ssh} {ssh -T you@mudhost}     or through anything that speaks bytes
+#session {mud} {mudhost}            open one, named — port 2323 unless you say
+#session {mud} {mudhost:4000}       ...or say it, either way round
+#session {mud} {mudhost} {4000}     tt++'s three-argument form, still fine
+#session {safe} {ssl://mudhost}     TLS, on 2324 unless you say otherwise
+#session {far} {ssh://you@mudhost}  through the system ssh, on 2322
 #session                            list them; * marks where typing goes
 #session {mud}                      switch to it
-#zap                                close this one and fall back to another
+#zap {mud}                          close it; bare #zap closes this one
 ```
+
+One verb opens every transport, because which door a mud answers on is not
+the sort of thing that should need a different command. `#ssl {name} {host}
+{port}` and `#run {name} {command}` are tt++'s spellings and still work —
+`#run` is also the way to a pipe that is not ssh.
+
+Once two are open, the useful thing is talking to one you are not watching:
+
+```
+#mud look                           run one command over there, then come back
+#all {say ready}                    run it in every session
+$session                            the name of the session you are in
+```
+
+`#name` and `#all` run in the target session's own focus, so a command sent
+there behaves exactly as if you had switched — its output is that session's,
+its triggers reply to that mud — and when it is done the focus is where you
+left it. `$session` is what a shared trigger uses to tell three characters
+apart: `#action {What is your name} {$session}` logs all of them in, each
+under its own.
 
 Text from a session you are not watching arrives tagged with its name, so
 two muds talking at once stay distinguishable and nothing is silently
@@ -182,6 +205,11 @@ whose line set them off rather than to whichever you happen to be looking
 at. Each session keeps its own connection, telnet state, reconnect settings
 and input queue; aliases, triggers and variables stay global, shared by all
 of them.
+
+Commands come first when judytin reads a `#word`, so a session named after
+one — `#send`, `#end` — is reached by switching to it instead; judytin says
+so when you open it. `ssh://` spawns a process, so like `#run` it is refused
+when a trigger is what asked (see [Security](#security)).
 
 With one session open judytin behaves exactly as it did before, including
 `#zap` leaving it disconnected but remembered, so `#reconnect` still works.
@@ -287,8 +315,11 @@ many layers of alias, function, variable and `#delay` it passes through.
 See [`src/data.rs`](src/data.rs) for the reasoning.
 
 Behind that, a second line of defence: commands with effects outside the
-game — `#system`, `#run`, `#read`, `#write`, `#log`, `#textin` — refuse to
-run when a trigger or event caused them, even indirectly through a timer.
+game — `#system`, `#run`, `#read`, `#write`, `#log`, `#textin`, and
+`#session` when its destination is an `ssh://` one — refuse to run when a
+trigger or event caused them, even indirectly through a timer. The gate is on
+the act, not the word: `#session {x} {ssh://host}` spawns a process exactly as
+`#run` does, so it is refused exactly as `#run` is.
 Type one yourself and it works normally. `#config {trigger shell} on` lifts
 the restriction if you need it; only do that for a MUD you would trust with
 your shell.
