@@ -10,6 +10,7 @@ mod net;
 mod pattern;
 mod script;
 mod telnet;
+mod tz;
 mod ui;
 
 use std::io::BufRead;

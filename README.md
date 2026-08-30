@@ -222,11 +222,21 @@ letting server text choose *when* it runs is the thing
   into the colored line at the right byte offsets.
 
 Deliberate deviations from tt++: macro keys use friendly names (`f5`,
-`ctrl-t`) instead of raw escape sequences; `%t` time formatting is UTC;
-trailing pattern wildcards are greedy (so `kill %1` captures the rest of
-the line instead of nothing). Not implemented: `#map` automapper, `#chat`
-/`#port` inter-client networking, multiple simultaneous sessions, MCCP
-compression, PCRE embedding in patterns.
+`ctrl-t`) instead of raw escape sequences; trailing pattern wildcards are
+greedy (so `kill %1` captures the rest of the line instead of nothing);
+aliases, triggers and variables are global rather than scoped per session.
+
+`%t` renders in local time, read from the system's own zone database
+(`/etc/localtime`, honouring `TZ`), with `%z` and `%Z` for the offset and
+its name. If the machine cannot say, it falls back to UTC and `%Z` says
+`UTC`, so a timestamp is never confidently wrong.
+
+Not implemented: `#map` automapper, `#chat`/`#port` inter-client
+networking, PCRE embedding in patterns. MCCP compression is not merely
+absent — judytin refuses the offer, and the refusal is deliberate: a
+decompressor on a stranger's byte stream is a zip bomb waiting to happen,
+and it would cost a dependency to gain nothing against a server that sends
+no telnet negotiation at all.
 
 ## Security
 

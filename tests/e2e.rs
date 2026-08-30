@@ -621,6 +621,60 @@ fn reconnect_returns_to_the_last_session_without_retyping_it() {
 }
 
 #[test]
+fn timestamps_render_in_the_zone_the_system_says() {
+    // Two zones with awkward offsets, one of them a 45-minute one, checked
+    // against each other rather than against a hardcoded clock: the difference
+    // between Kathmandu and UTC is fixed even though "now" is not.
+    let read = |tz: &str| -> String {
+        let out = run_judytin_with(
+            &["--dumb", "--offline"],
+            "#echo {%t} {%H:%M %z %Z}\n",
+            &[("TZ", tz)],
+        );
+        // The one line shaped like a clock. Matching on "+" would also catch
+        // the banner, which says TinTin++.
+        plain(&out)
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| {
+                let b = l.as_bytes();
+                b.len() > 5 && b[0].is_ascii_digit() && b[1].is_ascii_digit() && b[2] == b':'
+            })
+            .map(|l| l.to_string())
+            .unwrap_or_default()
+    };
+    let utc = read("UTC");
+    assert!(utc.contains("+0000"), "UTC did not render as +0000: {utc}");
+    assert!(utc.contains("UTC"), "UTC lost its name: {utc}");
+
+    let kat = read("Asia/Kathmandu");
+    assert!(
+        kat.contains("+0545"),
+        "a 45-minute zone was not read from the system database: {kat}"
+    );
+
+    // And the clock actually moved with the offset, not just the label.
+    let hh_utc: u32 = utc[..2].parse().expect("hour");
+    let hh_kat: u32 = kat[..2].parse().expect("hour");
+    assert_ne!(hh_utc, hh_kat, "the offset changed the label but not the time");
+}
+
+#[test]
+fn an_unreadable_zone_falls_back_to_utc_rather_than_lying() {
+    // A TZ naming nothing must not produce a confidently wrong local time.
+    let out = plain(&run_judytin_with(
+        &["--dumb", "--offline"],
+        "#echo {%t} {%z %Z}\n",
+        &[("TZ", "Nowhere/Nothing")],
+    ));
+    assert!(
+        out.contains("+0000") && out.contains("UTC"),
+        "an unknown zone did not fall back honestly:\n{}",
+        out
+    );
+}
+
+#[test]
 fn reconnect_without_a_session_says_so_rather_than_guessing() {
     let out = run_judytin_with(&["--dumb", "--offline"], "#reconnect\n", &[]);
     assert!(

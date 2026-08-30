@@ -2,9 +2,8 @@
 //! next argument. Padding modifiers on %s/%d: %+9s left-pad, %-9s
 //! right-pad, %.8s truncate.
 //!
-//! Deviations from tt++: %t renders in UTC (no timezone database), and the
-//! more exotic specifiers (%x charset, %S spellcheck, %M metric, %H hash)
-//! are not implemented.
+//! Deviations from tt++: the more exotic specifiers (%x charset, %S
+//! spellcheck, %M metric, %H hash) are not implemented.
 
 use crate::expr;
 
@@ -109,7 +108,7 @@ pub fn format(fmt: &str, args: &[String]) -> Result<String, String> {
             }
             't' => {
                 let a = next_arg(&mut arg_i);
-                strftime_utc(&a)
+                strftime_local(&a)
             }
             'T' => {
                 let _ = next_arg(&mut arg_i);
@@ -178,12 +177,21 @@ fn header(text: &str, width: usize) -> String {
     format!("{}{}{}", "#".repeat(left), label, "#".repeat(right))
 }
 
-/// Minimal strftime, UTC only: %Y %m %d %H %M %S %T %F %e %j %%.
-fn strftime_utc(fmt: &str) -> String {
-    let secs = std::time::SystemTime::now()
+/// Minimal strftime in local time: %Y %m %d %H %M %S %T %F %e %z %Z %%.
+///
+/// Local, not UTC, because that is what tt++ does and what anyone reading a
+/// timestamp assumes. The offset comes from the system's own zone data — see
+/// `crate::tz` — and falls back to UTC when the machine cannot say, in which
+/// case %Z says so rather than letting the reader assume otherwise.
+fn strftime_local(fmt: &str) -> String {
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    let (offset, zone) = crate::tz::local_at(now);
+    // Shift the instant and then render it as if it were UTC: the civil
+    // calendar arithmetic below does not care which zone it is counting in.
+    let secs = now + offset as i64;
     let (y, mo, d) = civil_from_days(secs.div_euclid(86400));
     let tod = secs.rem_euclid(86400);
     let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
@@ -204,6 +212,8 @@ fn strftime_utc(fmt: &str) -> String {
             Some('S') => out.push_str(&format!("{:02}", s)),
             Some('T') => out.push_str(&format!("{:02}:{:02}:{:02}", h, mi, s)),
             Some('F') => out.push_str(&format!("{}-{:02}-{:02}", y, mo, d)),
+            Some('z') => out.push_str(&crate::tz::offset_name(offset)),
+            Some('Z') => out.push_str(&zone),
             Some('%') => out.push('%'),
             Some(other) => {
                 out.push('%');
