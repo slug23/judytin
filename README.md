@@ -234,9 +234,29 @@ aliases, triggers and variables are global rather than scoped per session.
 its name. If the machine cannot say, it falls back to UTC and `%Z` says
 `UTC`, so a timestamp is never confidently wrong.
 
-Not implemented: `#chat`/`#port` inter-client networking, and `#list` —
-keyed variables exist (`$var[key]`) but the collection operations that build
-and walk them do not.
+Lists are keyed variables whose keys are `1, 2, 3…`, and `#list` is the set
+of operations over one:
+
+| command | what it does |
+|---|---|
+| `#list {p} {create} {a} {b}` | build it from the given items |
+| `#list {p} {add} {c}` / `{insert} {1} {c}` | append, or put at a position |
+| `#list {p} {get} {-1} {var}` / `{set} {2} {x}` | read or replace an item |
+| `#list {p} {size} {var}` / `{find} {pat} {var}` | count, or the index matching a pattern |
+| `#list {p} {delete} {2} {3}` / `{clear}` | remove some, or all |
+| `#list {p} {sort}` / `{reverse}` | reorder |
+| `#list {p} {collapse} {, }` / `{explode} {, }` | between a list and a plain `$p` |
+
+Indices count from `+1`, and `-1` is the last item, so `$p[-1]` is the tail.
+`find` takes a judytin pattern rather than a second regex dialect — the same
+thing `#action` takes, which since `{regex}` can hold a real expression.
+Splitting in `explode` respects escaping, so a separator that arrived inside
+server text cannot cut the text it belongs to.
+
+Not implemented: `#chat`/`#port` inter-client networking, `&var[]` for size
+(use `#list {p} {size} {n}`), and the rarer `#list` options — `shuffle`,
+`filter`, `refine`, `indexate`, `numerate`, `tokenize`, `copy`, `order`,
+`swap`, `simplify`.
 
 There is no automapper and there will not be one: `#path` and `#pathdir`
 already cover walking and reversing a route, which is the part that earns its

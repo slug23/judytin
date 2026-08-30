@@ -59,6 +59,99 @@ impl Recipe {
             Recipe::Pipe { label, .. } => format!("{} (pipe)", label),
         }
     }
+
+    /// Read a destination the way a person writes one.
+    ///
+    /// `host`, `host:port`, or a scheme that names the transport:
+    /// `tcp://`, `telnet://`, `ssl://`, `tls://`, `ssh://`. This is what lets
+    /// `#session` open every transport judytin has, instead of one verb per
+    /// transport with a different argument shape each. The vocabulary is the
+    /// one `--tls` and `--ssh` already use, so it is not a second thing to
+    /// learn, and the port each scheme defaults to is the same door judymud
+    /// answers on.
+    ///
+    /// `port` is the separate third argument of the classic
+    /// `#session {name} {host} {port}` form. Given, it wins: it is the more
+    /// deliberate way to type a port than tucking one inside a destination.
+    pub(crate) fn parse(dest: &str, port: Option<u16>) -> Result<Recipe, String> {
+        let dest = dest.trim();
+        if dest.is_empty() {
+            return Err("no host to connect to".to_string());
+        }
+        let (scheme, rest) = match dest.split_once("://") {
+            Some((s, r)) => (s.to_ascii_lowercase(), r),
+            None => (String::new(), dest),
+        };
+        // ssh is not a host and a port: it is a destination ssh itself parses,
+        // and its port belongs on ssh's own command line.
+        if scheme == "ssh" {
+            if rest.is_empty() {
+                return Err("ssh:// needs a destination, e.g. ssh://you@mudhost".to_string());
+            }
+            let d = match port {
+                // A port typed as the third argument replaces one written into
+                // the destination, rather than producing two of them.
+                Some(p) => {
+                    let base = match rest.rsplit_once(':') {
+                        Some((h, t)) if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) => h,
+                        _ => rest,
+                    };
+                    format!("{}:{}", base, p)
+                }
+                None => rest.to_string(),
+            };
+            return Ok(Recipe::Pipe {
+                label: d.clone(),
+                command: crate::net::ssh_command(&d),
+                ssh: Some(d),
+            });
+        }
+        let (host, embedded) = split_host_port(rest)?;
+        if host.is_empty() {
+            return Err(format!("'{}' has no host in it", dest));
+        }
+        let default = match scheme.as_str() {
+            "ssl" | "tls" => 2324,
+            _ => 2323,
+        };
+        let port = port.or(embedded).unwrap_or(default);
+        match scheme.as_str() {
+            "" | "tcp" | "telnet" => Ok(Recipe::Tcp { host, port }),
+            "ssl" | "tls" => Ok(Recipe::Tls { host, port }),
+            other => Err(format!(
+                "'{}://' is not a transport judytin has (tcp telnet ssl tls ssh)",
+                other
+            )),
+        }
+    }
+}
+
+/// Split `host`, `host:port` or `[v6]:port` without mistaking a bare IPv6
+/// address for one. `::1` is a host; `::1:80` is still a host, because the
+/// only way to put a port on an IPv6 address is to bracket it.
+fn split_host_port(s: &str) -> Result<(String, Option<u16>), String> {
+    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, "")) => (h, None),
+            Some((h, tail)) => match tail.strip_prefix(':') {
+                Some(p) => (h, Some(p)),
+                None => return Err(format!("'{}' has junk after the address", s)),
+            },
+            None => return Err(format!("'{}' opens a bracket it never closes", s)),
+        }
+    } else {
+        match s.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') && !p.is_empty() => (h, Some(p)),
+            _ => (s, None),
+        }
+    };
+    match port {
+        None => Ok((host.to_string(), None)),
+        Some(p) => match p.parse::<u16>() {
+            Ok(n) => Ok((host.to_string(), Some(n))),
+            Err(_) => Err(format!("'{}' is not a port number", p)),
+        },
+    }
 }
 
 /// One connection and everything that belongs to it.
@@ -363,12 +456,27 @@ impl App {
     // ---- variables & substitution ---------------------------------------
 
     pub fn get_var(&self, name: &str) -> Option<String> {
+        // $inv[-1] and $inv[+1] are positions in a list, not names. Rewriting
+        // here rather than in the substituter keeps it in one place and keeps
+        // it out of the parser, where a subscript is still just text.
+        let resolved = crate::list::resolve_name(&self.vars, name);
+        let name = resolved.as_deref().unwrap_or(name);
         for scope in self.locals.iter().rev() {
             if let Some(v) = scope.get(name) {
                 return Some(v.clone());
             }
         }
-        self.vars.get(name).cloned()
+        if let Some(v) = self.vars.get(name) {
+            return Some(v.clone());
+        }
+        // `$session` is where this is running, not something anyone set.
+        //
+        // A trigger fires in the focus of the session whose line set it off,
+        // and until now it had no way to ask which one that was — so three
+        // characters logging in needed three near-identical triggers instead
+        // of one. Last, so a variable the player did define still wins and no
+        // existing script changes meaning.
+        (name == "session").then(|| self.s().name.clone())
     }
 
     /// Update the innermost scope that has the name, else set globally.
@@ -591,6 +699,19 @@ impl App {
         self.start_pipe(label, command, None);
     }
 
+    /// Open whatever the recipe says. The one place that knows how each
+    /// transport is started, so `#session`, `#ssl`, `#run` and the automatic
+    /// retry all agree about what a recipe means.
+    pub(crate) fn start(&mut self, how: Recipe) {
+        match how {
+            Recipe::Tcp { host, port } => self.connect(&host, port),
+            Recipe::Tls { host, port } => self.connect_tls(&host, port),
+            Recipe::Pipe { label, command, ssh } => {
+                self.start_pipe(&label, &command, ssh.as_deref())
+            }
+        }
+    }
+
     fn start_pipe(&mut self, label: &str, command: &str, ssh_dest: Option<&str>) {
         if self.s().conn.is_some() {
             self.info("already connected — #zap first");
@@ -652,10 +773,22 @@ impl App {
         );
     }
 
+    /// Where `name` sits in `sessions`, if it is open at all.
+    ///
+    /// Exact first, then ignoring case: a name is the player's own word, and
+    /// `#Bob` should reach the session they called `bob` rather than inventing
+    /// a second one — but an exact match is never overruled by a sloppy one.
+    pub(crate) fn session_index(&self, name: &str) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|x| x.name == name)
+            .or_else(|| self.sessions.iter().position(|x| x.name.eq_ignore_ascii_case(name)))
+    }
+
     /// Make `name` the session that typing goes to, creating nothing.
     /// Returns false if there is no such session.
     pub(crate) fn switch_to(&mut self, name: &str) -> bool {
-        match self.sessions.iter().position(|x| x.name == name) {
+        match self.session_index(name) {
             Some(i) => {
                 self.cur = i;
                 self.update_status();
@@ -680,6 +813,17 @@ impl App {
             self.cur = i;
             return true;
         }
+        // Commands win over session names, so a session called after one
+        // cannot be reached by `#name`. Said now, while the name is still the
+        // player's to change, rather than left to be discovered.
+        if crate::commands::is_command_name(name) {
+            let msg = format!(
+                "note: #{} is already a command, so this session answers to \
+                 #session {{{}}} rather than #{}",
+                name, name, name
+            );
+            self.info(&msg);
+        }
         if self.s().name.is_empty() && self.s().conn.is_none() {
             self.s_mut().name = name.to_string();
             return true;
@@ -697,12 +841,27 @@ impl App {
     /// before judytin could hold more than one session, and there is no reason
     /// for that to change just because the count can now exceed one.
     pub(crate) fn close_session(&mut self) {
-        self.disconnect(false);
+        self.close_session_at(self.cur);
+    }
+
+    /// Close session `i`, which need not be the one being watched.
+    ///
+    /// The disconnect happens in that session's own focus, so its parting
+    /// words are tagged with its name and its events fire where they belong;
+    /// the focus then goes back to whichever session the player was actually
+    /// looking at, found by name because removing an element moves the ones
+    /// after it.
+    pub(crate) fn close_session_at(&mut self, i: usize) {
+        let gone = self.sessions[i].label().to_string();
+        self.on_session(i, |a| a.disconnect(false));
         if self.sessions.len() > 1 {
-            let gone = self.sessions.remove(self.cur);
-            self.cur = self.cur.min(self.sessions.len() - 1);
+            let watching = self.sessions[self.cur].name.clone();
+            self.sessions.remove(i);
+            self.cur = self
+                .session_index(&watching)
+                .unwrap_or_else(|| self.cur.min(self.sessions.len() - 1));
             let now = self.s().label().to_string();
-            self.info(&format!("closed {} — now on {}", gone.label(), now));
+            self.info(&format!("closed {} — now on {}", gone, now));
         }
         self.update_status();
     }
@@ -792,13 +951,7 @@ impl App {
         if !manual {
             self.s_mut().retry_n = self.s_mut().retry_n.saturating_add(1);
         }
-        match how {
-            Recipe::Tcp { host, port } => self.connect(&host, port),
-            Recipe::Tls { host, port } => self.connect_tls(&host, port),
-            Recipe::Pipe { label, command, ssh } => {
-                self.start_pipe(&label, &command, ssh.as_deref())
-            }
-        }
+        self.start(how);
         if self.s().conn.is_none() && !manual {
             self.arm_reconnect();
         }
@@ -958,7 +1111,7 @@ impl App {
     /// That is also the right answer for triggers: one firing on a background
     /// line replies to the session that produced the line, not to whichever
     /// the player happens to be watching.
-    fn on_session<R>(&mut self, i: usize, f: impl FnOnce(&mut Self) -> R) -> R {
+    pub(crate) fn on_session<R>(&mut self, i: usize, f: impl FnOnce(&mut Self) -> R) -> R {
         let back_to = self.s().name.clone();
         let watching = self.cur;
         self.cur = i;
@@ -1547,4 +1700,86 @@ pub fn normalize_key_spec(spec: &str) -> String {
         return format!("ctrl-{}", rest);
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tcp(dest: &str, port: Option<u16>) -> (String, u16) {
+        match Recipe::parse(dest, port).unwrap() {
+            Recipe::Tcp { host, port } => (host, port),
+            other => panic!("{dest:?} was not plain tcp: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bare_host_takes_judymuds_telnet_door() {
+        assert_eq!(tcp("mudhost", None), ("mudhost".into(), 2323));
+        // The classic three-argument form still says the port itself.
+        assert_eq!(tcp("mudhost", Some(4000)), ("mudhost".into(), 4000));
+    }
+
+    #[test]
+    fn a_port_may_ride_along_with_the_host() {
+        assert_eq!(tcp("mudhost:4000", None), ("mudhost".into(), 4000));
+        // Typed twice, the separate argument is the more deliberate one.
+        assert_eq!(tcp("mudhost:4000", Some(23)), ("mudhost".into(), 23));
+    }
+
+    #[test]
+    fn a_scheme_picks_the_transport_and_its_own_default_door() {
+        assert!(matches!(
+            Recipe::parse("ssl://mudhost", None),
+            Ok(Recipe::Tls { ref host, port: 2324 }) if host == "mudhost"
+        ));
+        assert!(matches!(
+            Recipe::parse("tls://mudhost:9000", None),
+            Ok(Recipe::Tls { port: 9000, .. })
+        ));
+        assert_eq!(tcp("telnet://mudhost", None), ("mudhost".into(), 2323));
+        assert_eq!(tcp("tcp://mudhost:99", None), ("mudhost".into(), 99));
+    }
+
+    #[test]
+    fn ssh_becomes_a_pipe_through_the_system_ssh() {
+        let Ok(Recipe::Pipe { label, command, ssh }) = Recipe::parse("ssh://grib@mudhost", None)
+        else {
+            panic!("ssh:// did not make a pipe")
+        };
+        assert_eq!(label, "grib@mudhost");
+        assert_eq!(ssh.as_deref(), Some("grib@mudhost"));
+        // judymud's ssh door, the same default --ssh uses.
+        assert!(command.contains("-p 2322"), "{command}");
+        assert!(command.contains("grib@mudhost"), "{command}");
+    }
+
+    #[test]
+    fn an_ssh_port_is_not_written_twice() {
+        let Ok(Recipe::Pipe { ssh, .. }) = Recipe::parse("ssh://grib@mudhost:2200", Some(2222))
+        else {
+            panic!("ssh:// did not make a pipe")
+        };
+        assert_eq!(ssh.as_deref(), Some("grib@mudhost:2222"));
+    }
+
+    #[test]
+    fn an_ipv6_address_is_a_host_not_a_host_and_a_port() {
+        // The colons are the address. Only brackets can carry a port.
+        assert_eq!(tcp("::1", None), ("::1".into(), 2323));
+        assert_eq!(tcp("fe80::1", Some(4000)), ("fe80::1".into(), 4000));
+        assert_eq!(tcp("[::1]:4000", None), ("::1".into(), 4000));
+        assert_eq!(tcp("[::1]", None), ("::1".into(), 2323));
+    }
+
+    #[test]
+    fn a_destination_that_makes_no_sense_says_so_rather_than_guessing() {
+        // Silently defaulting a bad port would connect somewhere unasked for.
+        assert!(Recipe::parse("mudhost:99999", None).is_err());
+        assert!(Recipe::parse("mudhost:nope", None).is_err());
+        assert!(Recipe::parse("gopher://mudhost", None).is_err());
+        assert!(Recipe::parse("", None).is_err());
+        assert!(Recipe::parse("[::1", None).is_err());
+        assert!(Recipe::parse("ssh://", None).is_err());
+    }
 }

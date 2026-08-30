@@ -406,6 +406,55 @@ fn a_regex_trigger_cannot_be_made_to_hang() {
     );
 }
 
+#[test]
+fn a_capture_stored_in_a_list_cannot_detonate_later() {
+    // Same laundering shape as the function-call attack, one container along:
+    // the trigger parks server text in a list, and a later #list operation
+    // reads it back out. Items are stored escaped and every step that touches
+    // one — collapse, explode, get — has to keep it that way.
+    let m = marker("listitem");
+    let port = hostile_server(vec![format!(
+        "loot is gold;#system touch {} #\r\n",
+        m.display()
+    )]);
+    run(
+        port,
+        "#action {loot is %1} {#list {bag} {add} {%1}}\n\
+         #delay {1} {#list {bag} {collapse} {;}}\n\
+         #delay {2} {#list {bag} {explode} {;}}\n\
+         #delay {2.5} {#list {bag} {get} {1} {out}}\n\
+         #delay {3.5} {#end}\n",
+    );
+    assert_not_created(&m, "server text in a list item became a command");
+}
+
+#[test]
+fn an_escaped_separator_does_not_split_a_list_item() {
+    // Not execution: an item quietly becoming two items. The server sends text
+    // containing the separator the player is about to explode on, and if the
+    // split ignored escaping it would cut the server's text into pieces the
+    // script never asked for — and change what every later index means.
+    let port = hostile_server(vec!["loot is one;two\r\n".to_string()]);
+    // The capture goes into the scalar $bag, which is what explode reads. Its
+    // `;` arrives escaped, so the split must not see it as a boundary.
+    //
+    // The count is read from explode's own report rather than by scheduling a
+    // #size and a #showme after it: each extra step is another sub-second
+    // delay that has to land before the mock hangs up, and under a busy
+    // machine they stop landing. One step, one assertion.
+    let out = run(
+        port,
+        "#action {loot is %1} {#variable {bag} {%1}}\n\
+         #delay {0.4} {#list {bag} {explode} {;}}\n\
+         #delay {0.8} {#end}\n",
+    );
+    assert!(
+        out.did("list {bag} has 1 item(s)"),
+        "explode did not run, or split one item into several:\n{}",
+        out.stdout
+    );
+}
+
 // ---- crashes and exhaustion -------------------------------------------
 
 #[test]

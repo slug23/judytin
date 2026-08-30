@@ -11,17 +11,26 @@ use crate::pattern;
 use crate::script::{get_arg, get_tail};
 
 const COMMANDS: &[&str] = &[
-    "action", "alias", "bell", "break", "buffer", "case", "class", "commands", "config",
+    "action", "alias", "all", "bell", "break", "buffer", "case", "class", "commands", "config",
     "continue", "cr", "default", "delay", "echo", "else", "elseif", "end", "event",
     "foreach", "format", "function", "gag", "grep", "help", "highlight", "history", "if",
     "info", "kill", "line", "local", "log", "loop", "macro", "math", "message", "nop",
-    "path", "pathdir", "read", "reconnect", "return", "run", "send", "session", "showme",
-    "split",
+    "list", "path", "pathdir", "read", "reconnect", "return", "run", "send", "session",
+    "showme", "split",
     "ssl", "substitute", "switch", "system", "tab", "textin", "ticker", "unaction", "unalias",
     "undelay", "unevent", "unfunction", "ungag", "unhighlight", "unmacro",
     "unsubstitute", "untab", "unticker", "unvariable", "variable", "while", "write",
     "zap",
 ];
+
+/// Whether `name` is a command judytin already answers to.
+///
+/// Asked when a session is opened: a session called `end` would be addressed
+/// by `#end`, which quits, so the player is told at the moment they choose the
+/// name rather than discovering it later.
+pub(crate) fn is_command_name(name: &str) -> bool {
+    COMMANDS.contains(&name.to_lowercase().as_str())
+}
 
 impl App {
     pub(crate) fn tintin_command(
@@ -30,8 +39,8 @@ impl App {
         depth: u32,
         chain: &mut Option<bool>,
     ) -> Flow {
-        let (name, rest) = get_arg(cmd);
-        let name = name.to_lowercase();
+        let (raw, rest) = get_arg(cmd);
+        let name = raw.to_lowercase();
         if name.is_empty() {
             self.info("what? try #help");
             return Flow::Ok;
@@ -43,6 +52,21 @@ impl App {
         }
         let resolved = if COMMANDS.contains(&name.as_str()) {
             name.clone()
+        } else if let Some(i) = self.session_index(&raw) {
+            // A session answers to its own name: `#bob look` runs in bob's
+            // focus and leaves the focus where it was. Checked before
+            // abbreviations on purpose — an exact name the player chose beats
+            // a guess at a command they half-typed, which is what makes a
+            // session called `a` reachable at all when `#a` could be #action,
+            // #alias or #all. An exact command name still wins, so a session
+            // named after one is addressed by switching to it; `open_session`
+            // says so at the time.
+            *chain = None;
+            let body = get_tail(rest);
+            self.on_session(i, |a| {
+                let _ = a.run_input(&body, depth + 1);
+            });
+            return Flow::Ok;
         } else {
             let hits: Vec<&&str> = COMMANDS.iter().filter(|c| c.starts_with(&name)).collect();
             match hits.len() {
@@ -74,8 +98,10 @@ impl App {
                 self.info("goodbye — judytin signing off");
                 self.quit = true;
             }
-            "zap" => self.close_session(),
+            "zap" => self.cmd_zap(rest, depth),
+            "all" => self.cmd_all(rest, depth),
             "reconnect" => self.cmd_reconnect(),
+            "list" => self.cmd_list_op(rest, depth),
             "session" => self.cmd_session(rest, depth),
             "ssl" => self.cmd_ssl(rest, depth),
             "run" => self.cmd_run(rest, depth),
@@ -633,6 +659,157 @@ impl App {
         self.vars.insert(key.clone(), val.clone());
         self.tag_class("variable", &key);
         self.info_kind("variable", &format!("ok. variable {{{}}} = {{{}}}", key, val));
+    }
+
+    /// `#list {name} {option} {args}` — tt++'s operations over a list, which is
+    /// a keyed variable whose keys are 1, 2, 3…
+    ///
+    /// Items are stored the way `#variable` stores a value: substituted, and
+    /// still escaped, so server text inside one stays data until a sink.
+    fn cmd_list_op(&mut self, rest: &str, depth: u32) {
+        let (name, r2) = get_arg(rest);
+        let (op, r3) = get_arg(r2);
+        let name = self.subst(&name, depth);
+        if name.is_empty() || op.is_empty() {
+            self.info(
+                "usage: #list {name} {create|add|clear|get|set|size|find|delete|\
+                 insert|sort|reverse|explode|collapse} {args}",
+            );
+            return;
+        }
+        // Whatever is left, as a list of braced groups.
+        let mut args: Vec<String> = Vec::new();
+        let mut r = r3;
+        loop {
+            let (a, next) = get_arg(r);
+            if a.is_empty() && next.trim().is_empty() {
+                break;
+            }
+            args.push(self.subst(&a, depth));
+            if next == r {
+                break;
+            }
+            r = next;
+        }
+        let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
+        let mut items = crate::list::items(&self.vars, &name);
+
+        match op.to_lowercase().as_str() {
+            "create" => {
+                items = args.clone();
+                self.store_list(&name, &items);
+            }
+            "add" => {
+                items.extend(args.iter().cloned());
+                self.store_list(&name, &items);
+            }
+            "clear" => self.store_list(&name, &[]),
+            "sort" => {
+                items.sort();
+                self.store_list(&name, &items);
+            }
+            "reverse" => {
+                items.reverse();
+                self.store_list(&name, &items);
+            }
+            "size" => {
+                let n = items.len().to_string();
+                self.assign(&arg(0), &n);
+            }
+            "get" => match crate::list::resolve(&arg(0), items.len(), false) {
+                Some(p) => {
+                    let v = items[p - 1].clone();
+                    self.assign(&arg(1), &v);
+                }
+                None => self.bad_index(&name, &arg(0), items.len()),
+            },
+            "set" => match crate::list::resolve(&arg(0), items.len(), false) {
+                Some(p) => {
+                    items[p - 1] = arg(1);
+                    self.store_list(&name, &items);
+                }
+                None => self.bad_index(&name, &arg(0), items.len()),
+            },
+            "insert" => match crate::list::resolve(&arg(0), items.len(), true) {
+                Some(p) => {
+                    items.insert(p - 1, arg(1));
+                    self.store_list(&name, &items);
+                }
+                None => self.bad_index(&name, &arg(0), items.len()),
+            },
+            "delete" => match crate::list::resolve(&arg(0), items.len(), false) {
+                Some(p) => {
+                    let n: usize = arg(1).trim().parse().unwrap_or(1);
+                    let end = (p - 1 + n.max(1)).min(items.len());
+                    items.drain(p - 1..end);
+                    self.store_list(&name, &items);
+                }
+                None => self.bad_index(&name, &arg(0), items.len()),
+            },
+            "find" => {
+                // judytin's own pattern language, not a second regex dialect —
+                // the same thing #action and #gag take, which since {regex}
+                // landed can hold a real expression anyway. Matching is a sink,
+                // so the item is unescaped for it and stays escaped in store.
+                let pat = crate::data::unescape(&arg(0));
+                let found = items
+                    .iter()
+                    .position(|it| pattern::matches(&pat, &crate::data::unescape(it)).is_some());
+                let out = found.map(|i| (i + 1).to_string()).unwrap_or_else(|| "0".into());
+                self.assign(&arg(1), &out);
+            }
+            "explode" => {
+                // The scalar $name becomes the list name[1..]. Splitting has to
+                // respect escapes or a separator that arrived from a server
+                // would cut the text it was supposed to be part of.
+                let sep = arg(0);
+                let whole = self.get_var(&name).unwrap_or_default();
+                items = crate::list::split_on(&whole, &sep);
+                self.store_list(&name, &items);
+            }
+            "collapse" => {
+                let sep = arg(0);
+                let joined = items.join(&sep);
+                self.vars.insert(name.clone(), joined.clone());
+                self.info_kind("variable", &format!("ok. variable {{{}}} = {{{}}}", name, joined));
+            }
+            other => {
+                self.info(&format!(
+                    "unknown #list option '{}' (create add clear get set size find \
+                     delete insert sort reverse explode collapse)",
+                    other
+                ));
+            }
+        }
+    }
+
+    /// Write a list back and say what it now holds.
+    fn store_list(&mut self, name: &str, items: &[String]) {
+        crate::list::store(&mut self.vars, name, items);
+        self.tag_class("variable", name);
+        self.info_kind(
+            "variable",
+            &format!("ok. list {{{}}} has {} item(s)", name, items.len()),
+        );
+    }
+
+    /// The `{variable}` half of get/size/find, which is where their answer goes.
+    fn assign(&mut self, into: &str, value: &str) {
+        if into.is_empty() {
+            self.info(&format!("nowhere to put it: {}", value));
+            return;
+        }
+        self.set_var(into, value);
+        self.info_kind("variable", &format!("ok. variable {{{}}} = {{{}}}", into, value));
+    }
+
+    fn bad_index(&mut self, name: &str, idx: &str, len: usize) {
+        self.info(&format!(
+            "no item {} in {{{}}} — it has {} item(s); +1 is the first, -1 the last",
+            if idx.is_empty() { "(none given)" } else { idx },
+            name,
+            len
+        ));
     }
 
     fn cmd_action(&mut self, rest: &str) {
@@ -1527,47 +1704,85 @@ impl App {
         self.reconnect(true);
     }
 
-    /// `#session` lists, `#session {name}` switches, `#session {name} {host}
-    /// {port}` opens. The three-argument form is what tt++ has always had; the
-    /// first two only became meaningful once judytin could hold more than one.
+    /// `#session` lists, `#session {name}` switches, and
+    /// `#session {name} {where}` opens.
+    ///
+    /// `{where}` is one destination in any of the shapes people write them —
+    /// `host`, `host:port`, `ssl://host`, `ssh://you@host` — with the port
+    /// still available as a separate third argument, which is the form tt++
+    /// has always had. One verb for every transport is the point: `#ssl` and
+    /// `#run` remain, but nobody has to know three argument shapes to open a
+    /// second window on a mud.
     fn cmd_session(&mut self, rest: &str, depth: u32) {
         let (name, r2) = get_arg(rest);
-        let (host, r3) = get_arg(r2);
+        let (dest, r3) = get_arg(r2);
         let (port_s, _) = get_arg(r3);
         if name.is_empty() {
             self.list_sessions();
             return;
         }
         let name = crate::data::unescape(&self.subst(&name, depth));
-        if host.is_empty() {
+        if dest.is_empty() {
             if self.switch_to(&name) {
                 let msg = format!("now on {}", self.s().label());
                 self.info(&msg);
             } else {
                 self.info(&format!(
                     "no session called {} — #session lists them, \
-                     #session {{{}}} {{host}} {{port}} opens it",
+                     #session {{{}}} {{host}} opens it",
                     name, name
                 ));
             }
             return;
         }
-        let host = self.subst(&host, depth);
-        let port_s = self.subst(&port_s, depth);
-        let port: u16 = match port_s.parse() {
-            Ok(p) => p,
+        let dest = crate::data::unescape(&self.subst(&dest, depth));
+        let Some(port) = self.read_port(&port_s, depth) else { return };
+        self.open_and_start(&name, &dest, port);
+    }
+
+    /// Read the optional third argument. `None` inside the `Some` means the
+    /// player did not type a port, which is different from typing a bad one:
+    /// the first defaults, the second is an error worth saying out loud.
+    fn read_port(&mut self, port_s: &str, depth: u32) -> Option<Option<u16>> {
+        let p = self.subst(port_s, depth);
+        let p = p.trim();
+        if p.is_empty() {
+            return Some(None);
+        }
+        match p.parse::<u16>() {
+            Ok(n) => Some(Some(n)),
             Err(_) => {
-                self.info(&format!("'{}' is not a port number", port_s));
-                return;
+                self.info(&format!("'{}' is not a port number", p));
+                None
             }
-        };
-        if self.open_session(&name) {
-            self.connect(&host, port);
         }
     }
 
-    /// What is open, and which one is listening to you.
+    /// Open `name` at `dest` and connect it.
+    ///
+    /// The one path every opening command reaches, so the pipe gate cannot be
+    /// stepped around by picking a different spelling of the same thing.
+    fn open_and_start(&mut self, name: &str, dest: &str, port: Option<u16>) {
+        let how = match crate::app::Recipe::parse(dest, port) {
+            Ok(h) => h,
+            Err(e) => return self.info(&e),
+        };
+        // A pipe runs a program on this machine. `#run` is gated for exactly
+        // that reason, and `ssh://` is the same act under another name — if
+        // the gate depended on which word was typed it would not be a gate.
+        if matches!(how, crate::app::Recipe::Pipe { .. })
+            && !self.guard_local_effects("#session {ssh://...}")
+        {
+            return;
+        }
+        if self.open_session(name) {
+            self.start(how);
+        }
+    }
+
+    /// What is open, where it goes, and which one is listening to you.
     fn list_sessions(&mut self) {
+        let width = self.sessions.iter().map(|x| x.label().chars().count()).max().unwrap_or(1);
         let rows: Vec<String> = self
             .sessions
             .iter()
@@ -1579,17 +1794,68 @@ impl App {
                     // would just say the name twice.
                     (Some(c), 0) => format!("({})", c.kind()),
                     (Some(c), p) => format!("{}:{} ({})", x.host, p, c.kind()),
-                    (None, _) => "not connected".to_string(),
+                    // Not connected, but judytin may be on its way back —
+                    // which is the one thing a listing must not hide, since
+                    // it is the difference between a dead row and a busy one.
+                    (None, _) => match (x.retry_at.is_some(), &x.recipe) {
+                        (true, Some(r)) => format!("reconnecting to {}", r.describe()),
+                        (false, Some(r)) => format!("not connected ({})", r.describe()),
+                        (_, None) => "not connected".to_string(),
+                    },
                 };
-                format!("{} {} — {}", here, x.label(), where_)
+                format!("{} {:<w$} — {}", here, x.label(), where_, w = width)
             })
             .collect();
         for row in rows {
             self.info(&row);
         }
-        self.info("* is where typing goes. #session {name} switches.");
+        self.info("* is where typing goes. #session {name} switches, #name runs one command there, #all {command} runs it everywhere.");
     }
 
+    /// `#all {command}` — run it once in every open session.
+    ///
+    /// The counterpart to `#name`: together they are what makes several
+    /// characters one party rather than several clients. Every session, not
+    /// only the connected ones, so `#all {#reconnect}` can pick a party back
+    /// up after the server blinked.
+    fn cmd_all(&mut self, rest: &str, depth: u32) {
+        let body = get_tail(rest);
+        if body.trim().is_empty() {
+            self.info("usage: #all {command} — run it in every open session");
+            return;
+        }
+        // Walked by name rather than by index: the command is free to open or
+        // close sessions, and an index taken beforehand would then point at
+        // whichever session slid into the gap.
+        let names: Vec<String> = self.sessions.iter().map(|x| x.name.clone()).collect();
+        for n in names {
+            let Some(i) = self.session_index(&n) else { continue };
+            self.on_session(i, |a| {
+                let _ = a.run_input(&body, depth + 1);
+            });
+        }
+    }
+
+    /// `#zap` closes the session you are watching, `#zap {name}` any other.
+    fn cmd_zap(&mut self, rest: &str, depth: u32) {
+        let name = get_tail(rest);
+        if name.trim().is_empty() {
+            self.close_session();
+            return;
+        }
+        let name = crate::data::unescape(&self.subst(&name, depth));
+        match self.session_index(&name) {
+            Some(i) => self.close_session_at(i),
+            None => self.info(&format!(
+                "no session called {} — #session lists them",
+                name
+            )),
+        }
+    }
+
+    /// `#ssl {name} {host} {port}` — tt++'s spelling of `ssl://`, kept because
+    /// it is the one people's scripts already have. Same opening path, so it
+    /// gains the optional port and the destination forms for free.
     fn cmd_ssl(&mut self, rest: &str, depth: u32) {
         let (name, r2) = get_arg(rest);
         let (host, r3) = get_arg(r2);
@@ -1598,23 +1864,13 @@ impl App {
             self.info("usage: #ssl {name} {host} {port} — telnet over TLS");
             return;
         }
-        let host = self.subst(&host, depth);
-        let port_s = self.subst(&port_s, depth);
-        let port: u16 = if port_s.is_empty() {
-            2324
-        } else {
-            match port_s.parse() {
-                Ok(p) => p,
-                Err(_) => {
-                    self.info(&format!("'{}' is not a port number", port_s));
-                    return;
-                }
-            }
-        };
+        let host = crate::data::unescape(&self.subst(&host, depth));
+        let Some(port) = self.read_port(&port_s, depth) else { return };
         let name = crate::data::unescape(&self.subst(&name, depth));
-        if self.open_session(&name) {
-            self.connect_tls(&host, port);
-        }
+        // A destination that already names its transport says what it means;
+        // only a bare host needs telling that #ssl meant TLS.
+        let dest = if host.contains("://") { host } else { format!("ssl://{}", host) };
+        self.open_and_start(&name, &dest, port);
     }
 
     fn cmd_run(&mut self, rest: &str, depth: u32) {
@@ -1877,6 +2133,9 @@ impl App {
   %1..%99 are wildcards/arguments, $name inserts a variable, @func{} calls\r
   #5 {commands} repeats 5 times, ! recalls history, tab completes words\r
 \r
+  \x1b[1mlists\x1b[0m     #list {name} {create|add|clear|get|set|size|find} {args}\r
+            #list {name} {insert|delete|sort|reverse|explode|collapse}\r
+            items live in $name[1]..; $name[-1] is the last\r
   \x1b[1msession\x1b[0m   #session {name} {host} {port} opens, #zap closes, #end quits\r
             #session lists them, #session {name} switches between them\r
             #reconnect  return to the last session, whatever the transport\r

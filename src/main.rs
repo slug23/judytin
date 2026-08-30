@@ -6,6 +6,7 @@ mod commands;
 mod data;
 mod expr;
 mod fmt;
+mod list;
 mod net;
 mod pattern;
 mod script;
