@@ -7,6 +7,12 @@
 //!   any-but-newline, `%+` one or more, `%?` zero or one, `%.` exactly one
 //! - `%i` / `%I` switch to case-insensitive / sensitive from that point
 //! - `^` start anchor, `$` end anchor, `%%` literal percent
+//! - `{regex}` embeds a real regular expression, capturing like a wildcard
+//!
+//! The embedded regex is compiled by the `regex` crate, chosen for its
+//! linear-time guarantee: the subject is a line a stranger sent, and a
+//! backtracking engine there is a denial of service waiting to be written into
+//! somebody's trigger. `\{` is still a literal brace.
 //!
 //! Unnumbered wildcards are assigned the next free capture index in order
 //! of appearance, so they can be used as %1, %2, ... in trigger bodies.
@@ -53,12 +59,74 @@ impl Class {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 enum Tok {
     Lit(String),
     Wild(Class, u8),
+    /// An embedded regular expression, capturing into `n` like a wildcard.
+    Re(Box<Re>),
     CaseInsensitive,
     CaseSensitive,
+}
+
+/// A compiled `{regex}` group.
+///
+/// Two forms of the same expression: `head` anchored at the start finds the
+/// span the regex would naturally take, which is the answer almost every time;
+/// `exact` is anchored at both ends so a span can be tested when the rest of
+/// the pattern fails and the match has to give ground.
+#[derive(Debug, Clone)]
+struct Re {
+    head: regex::Regex,
+    exact: regex::Regex,
+    n: u8,
+    /// The source text, for equality and for debugging.
+    src: String,
+}
+
+// Regex has no PartialEq, and comparing compiled programs is not the question
+// anyone is asking: two tokens are the same when they came from the same text.
+impl PartialEq for Tok {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Tok::Lit(a), Tok::Lit(b)) => a == b,
+            (Tok::Wild(a, i), Tok::Wild(b, j)) => a == b && i == j,
+            (Tok::Re(a), Tok::Re(b)) => a.src == b.src && a.n == b.n,
+            (Tok::CaseInsensitive, Tok::CaseInsensitive) => true,
+            (Tok::CaseSensitive, Tok::CaseSensitive) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Compiled size cap. Patterns are written by the player, not the server, so
+/// this is a guard against a slip rather than an attack — but an unbounded
+/// compile is still a way to lose a client to a typo.
+const RE_SIZE_LIMIT: usize = 1 << 20;
+
+/// What scanning `len` bytes costs against the budget. Divided so that an
+/// ordinary MUD line stays nearly free while a flood cannot be scanned over
+/// and over for nothing.
+fn scan_cost(len: usize) -> u64 {
+    (len as u64 / 16) + 1
+}
+
+/// Build both forms. `(?s)` because judytin matches one line at a time and a
+/// `.` that refuses newlines would only surprise people.
+fn compile_re(src: &str, n: u8) -> Option<Re> {
+    let build = |wrapped: String| {
+        regex::RegexBuilder::new(&wrapped)
+            .size_limit(RE_SIZE_LIMIT)
+            .dot_matches_new_line(true)
+            .build()
+            .ok()
+    };
+    Some(Re {
+        head: build(format!("^(?:{})", src))?,
+        exact: build(format!("^(?:{})$", src))?,
+        n,
+        src: src.to_string(),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +173,50 @@ pub fn compile(pat: &str) -> Pattern {
                 lit.push(n);
             } else {
                 lit.push('\\');
+            }
+            continue;
+        }
+        if c == '{' {
+            // Brace depth, because a regex quantifier is written {2,3}. An
+            // escaped brace was already consumed above as a literal.
+            let mut depth = 1usize;
+            let mut src = String::new();
+            let mut closed = false;
+            while let Some(n) = chars.next() {
+                if n == '\\' {
+                    src.push('\\');
+                    if let Some(e) = chars.next() {
+                        src.push(e);
+                    }
+                    continue;
+                }
+                if n == '{' {
+                    depth += 1;
+                } else if n == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        closed = true;
+                        break;
+                    }
+                }
+                src.push(n);
+            }
+            // An unclosed group, or one the regex engine will not accept, is
+            // treated as the literal text it was before this feature existed.
+            // Silently never matching would be a worse answer than the old one.
+            match closed.then(|| compile_re(&src, 0)).flatten() {
+                Some(mut re) => {
+                    re.n = alloc(&mut used, &mut next_idx);
+                    flush(&mut lit, &mut toks);
+                    toks.push(Tok::Re(Box::new(re)));
+                }
+                None => {
+                    lit.push('{');
+                    lit.push_str(&src);
+                    if closed {
+                        lit.push('}');
+                    }
+                }
             }
             continue;
         }
@@ -194,11 +306,23 @@ const MATCH_BUDGET: u64 = 250_000;
 impl Ctx {
     /// Charge one unit of work; false once the budget is spent.
     fn charge(&self) -> bool {
+        self.charge_n(1)
+    }
+
+    /// Charge `n` units.
+    ///
+    /// A wildcard step is one unit because it inspects one character. A regex
+    /// call is not: it scans the whole span it is given, so charging it one
+    /// unit lets a long line buy an unbounded amount of work for nothing. The
+    /// divisor keeps a regex from looking more expensive than it is while
+    /// still making the cost scale with the text.
+    fn charge_n(&self, n: u64) -> bool {
         let left = self.budget.get();
-        if left == 0 {
+        if left < n {
+            self.budget.set(0);
             return false;
         }
-        self.budget.set(left - 1);
+        self.budget.set(left - n);
         true
     }
 }
@@ -266,6 +390,55 @@ fn match_toks(
         Some(Tok::Lit(s)) => {
             let r = lit_strip(rest, s, ci)?;
             match_toks(ctx, &toks[1..], r, ci, caps).map(|c| c + (rest.len() - r.len()))
+        }
+        Some(Tok::Re(re)) => {
+            // The span the regex takes on its own terms — greedy or lazy as
+            // the author wrote it — is tried first, because it is the answer
+            // whenever the rest of the pattern agrees.
+            // Scanning `rest` costs about `rest.len()`; see `charge_n`.
+            if !ctx.charge_n(scan_cost(rest.len())) {
+                return None;
+            }
+            let natural = re.head.find(rest).map(|m| m.end());
+            let mut tried = None;
+            if let Some(end) = natural
+                && ctx.charge()
+            {
+                let mark = caps.len();
+                caps.push((re.n, rest[..end].to_string()));
+                if let Some(c) = match_toks(ctx, &toks[1..], &rest[end..], ci, caps) {
+                    return Some(end + c);
+                }
+                caps.truncate(mark);
+                tried = Some(end);
+            }
+            // It did not, so give ground: any shorter span the regex also
+            // accepts exactly. Longest first, so a greedy group stays greedy.
+            //
+            // Iterated rather than collected: `rest` is a line a stranger sent,
+            // and materialising one entry per character would hand them a
+            // megabyte of allocation per attempt before the budget below ever
+            // got a chance to say no.
+            let ends = std::iter::once(rest.len())
+                .chain(rest.char_indices().rev().map(|(i, _)| i));
+            for end in ends {
+                if Some(end) == tried {
+                    continue;
+                }
+                if !ctx.charge_n(scan_cost(end)) {
+                    return None;
+                }
+                if !re.exact.is_match(&rest[..end]) {
+                    continue;
+                }
+                let mark = caps.len();
+                caps.push((re.n, rest[..end].to_string()));
+                if let Some(c) = match_toks(ctx, &toks[1..], &rest[end..], ci, caps) {
+                    return Some(end + c);
+                }
+                caps.truncate(mark);
+            }
+            None
         }
         Some(Tok::Wild(class, n)) => {
             let last = toks[1..]
@@ -519,6 +692,67 @@ mod tests {
         let (a, b, caps) = find(&pat, "one big goblin here now").unwrap();
         assert_eq!(&"one big goblin here now"[a..b], "big goblin here");
         assert_eq!(caps[0].1, "goblin");
+    }
+
+    #[test]
+    fn an_embedded_regex_captures_like_a_wildcard() {
+        let caps = matches("you hit the {\\w+} for {\\d+} damage", "you hit the goblin for 42 damage")
+            .expect("should match");
+        assert_eq!(caps, vec![(1, "goblin".to_string()), (2, "42".to_string())]);
+    }
+
+    #[test]
+    fn a_quantifier_brace_does_not_end_the_group() {
+        // {2,3} inside the regex is a quantifier, not the closing brace.
+        let caps = matches("roll {[0-9]{1,2}}d", "roll 20d").expect("should match");
+        assert_eq!(caps, vec![(1, "20".to_string())]);
+        assert!(matches("roll {[0-9]{1,2}}d", "roll 200d").is_none());
+    }
+
+    #[test]
+    fn a_regex_gives_ground_when_the_rest_needs_it() {
+        // A greedy group would swallow the trailing literal; the match has to
+        // back off to let "end" match, which a single greedy pass cannot do.
+        let caps = matches("{.*}end", "beginning and end").expect("should match");
+        assert_eq!(caps, vec![(1, "beginning and ".to_string())]);
+    }
+
+    #[test]
+    fn regexes_and_wildcards_mix() {
+        let caps = matches("%1 says {hello|hi}", "Bob says hi").expect("should match");
+        assert_eq!(caps, vec![(1, "Bob".to_string()), (2, "hi".to_string())]);
+    }
+
+    #[test]
+    fn an_escaped_brace_is_still_a_literal_brace() {
+        assert!(matches(r"a \{literal\} brace", "a {literal} brace").is_some());
+        // ...and the regex reading is not attempted on it.
+        assert!(matches(r"a \{literal\} brace", "a x brace").is_none());
+    }
+
+    #[test]
+    fn a_group_that_is_not_a_regex_stays_the_text_it_was() {
+        // Before this feature braces in a pattern were ordinary characters.
+        // An unclosed group, or one the engine rejects, must not silently
+        // become a pattern that never matches.
+        assert!(matches("say {unclosed", "say {unclosed").is_some());
+        assert!(matches("nums {[0-9}", "nums {[0-9}").is_some());
+    }
+
+    #[test]
+    fn a_regex_pattern_cannot_be_made_to_hang() {
+        // The subject is a stranger's line. This is the shape that kills a
+        // backtracking engine; the regex crate is linear, and the budget
+        // catches the enumeration around it.
+        let line = "a".repeat(40_000);
+        let start = std::time::Instant::now();
+        let _ = matches("{(a+)+$}b", &line);
+        let _ = matches("{a*a*a*a*a*a*c}", &line);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "matching took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

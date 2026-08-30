@@ -345,6 +345,67 @@ fn a_capture_cannot_pick_which_entry_a_table_lookup_returns() {
     assert!(out.did("got public-value"), "the lookup did not happen:\n{}", out.stdout);
 }
 
+#[test]
+fn server_text_cannot_become_a_regex() {
+    // {regex} in a pattern is now a compiled expression. A trigger that builds
+    // another trigger from a capture therefore has a new way to go wrong: if
+    // the capture reached `compile` unescaped, a server could install a
+    // pattern of its own choosing — `{.*}` matches every line, which turns one
+    // trigger into a trigger on everything.
+    let port = hostile_server(vec![
+        "{.*} arrives\r\n".to_string(),
+        "some unrelated line\r\n".to_string(),
+    ]);
+    let out = run(
+        port,
+        "#action {%1 arrives} {#action {%1} {#showme PWNED}}\n\
+         #delay {2} {#end}\n",
+    );
+    // Neither the echo of the command nor the "#ok." that confirms it counts:
+    // both quote the body back, marker and all. Only the trigger actually
+    // running prints the marker on a line of its own.
+    let fired = out
+        .stdout
+        .lines()
+        .any(|l| l.contains("PWNED") && !l.contains(">> ") && !l.contains("#ok."));
+    assert!(
+        !fired,
+        "a capture became a live regex and matched everything:\n{}",
+        out.stdout
+    );
+    // And prove the trigger was really installed, or this proves nothing: the
+    // pattern is stored with its escapes, which is what keeps it literal.
+    assert!(
+        out.says(r"\{.*\}"),
+        "the nested action was never created:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn a_regex_trigger_cannot_be_made_to_hang() {
+    // The subject is a stranger's line, so the classic catastrophic-
+    // backtracking shape is theirs to send. Two defences: the regex crate is
+    // linear in the subject, and the match budget charges for the length
+    // scanned rather than per call — without the second, this took three
+    // minutes on a line the server picked.
+    let flood = "a".repeat(60_000);
+    let port = hostile_server(vec![format!("{flood}\r\n"), format!("{flood}\r\n")]);
+    let out = run(
+        port,
+        "#action {{(a+)+$}b} {#showme never}\n\
+         #action {{a*a*a*a*a*c}} {#showme never}\n\
+         #delay {3} {#end}\n",
+    );
+    assert!(!out.says("panicked"), "crashed on a regex flood:\n{}", out.stdout);
+    assert_eq!(
+        out.status,
+        Some(0),
+        "the event loop stopped servicing timers while matching:\n{}",
+        out.stdout
+    );
+}
+
 // ---- crashes and exhaustion -------------------------------------------
 
 #[test]

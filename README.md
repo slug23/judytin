@@ -1,9 +1,9 @@
 # judytin
 
 A [TinTin++](https://tintin.mudhalla.net/)-style MUD client, built for
-judymud but happy on any MUD. One small Rust binary, three dependencies
-(crossterm, rustls, sha2), and the tt++ scripting dialect your muscle
-memory already knows.
+judymud but happy on any MUD. One small Rust binary, four dependencies
+(crossterm, rustls, sha2, regex), and the tt++ scripting dialect your
+muscle memory already knows.
 
 ## Quick start
 
@@ -64,9 +64,10 @@ default host on port 4000. Two arguments are still host then port.
 
 Commands start with `#` and may be abbreviated (`#al`, `#act`, `#high`, ...).
 `;` separates commands, `{}` groups arguments, `%1`–`%99` are
-wildcards/arguments, `$name` inserts a variable (`$name[key]` an entry in a
-keyed one, nesting as `$a[b][c]`, with the key itself computed if you write
-`$hp[$who]`), `@func{args}` calls a
+wildcards/arguments, `{regex}` embeds a real regular expression that captures
+like a wildcard (`\{` is still a literal brace), `$name` inserts a variable
+(`$name[key]` an entry in a keyed one, nesting as `$a[b][c]`, with the key
+itself computed if you write `$hp[$who]`), `@func{args}` calls a
 function, `#5 {commands}` repeats five times, `!` recalls history, Tab
 completes words from recent output.
 
@@ -233,13 +234,18 @@ aliases, triggers and variables are global rather than scoped per session.
 its name. If the machine cannot say, it falls back to UTC and `%Z` says
 `UTC`, so a timestamp is never confidently wrong.
 
-Not implemented: `#map` automapper, `#chat`/`#port` inter-client
-networking, PCRE embedding in patterns, and `#list` — keyed variables exist
-(`$var[key]`) but the collection operations that build and walk them do not. MCCP compression is not merely
-absent — judytin refuses the offer, and the refusal is deliberate: a
-decompressor on a stranger's byte stream is a zip bomb waiting to happen,
-and it would cost a dependency to gain nothing against a server that sends
-no telnet negotiation at all.
+Not implemented: `#chat`/`#port` inter-client networking, and `#list` —
+keyed variables exist (`$var[key]`) but the collection operations that build
+and walk them do not.
+
+There is no automapper and there will not be one: `#path` and `#pathdir`
+already cover walking and reversing a route, which is the part that earns its
+keep, and the rest is a research problem about naming a room from its prose.
+
+MCCP compression is likewise not merely absent — judytin refuses the offer,
+and the refusal is deliberate: a decompressor on a stranger's byte stream is
+a zip bomb waiting to happen, and it would cost a dependency to gain nothing
+against a server that sends no telnet negotiation at all.
 
 ## Security
 
@@ -275,7 +281,10 @@ Also deliberate:
   filtered out of server output; SGR colour passes through.
 - **Line length and match effort are bounded**, so a server cannot exhaust
   memory with a line that never ends, or freeze the client with a padded
-  one.
+  one. The match budget charges for the length scanned, not per step, which
+  matters now that `{regex}` groups scan a whole span at a time; the regex
+  engine is the `regex` crate, chosen because it is linear in the subject and
+  the subject is a stranger's line.
 - **TLS pinning fails closed.** A changed certificate is refused, and so is
   a damaged entry in `~/.judytin_known_hosts` — rather than silently
   treating it as a first connection. Note this is trust-on-first-use, like
