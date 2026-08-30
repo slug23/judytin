@@ -15,7 +15,8 @@ const COMMANDS: &[&str] = &[
     "continue", "cr", "default", "delay", "echo", "else", "elseif", "end", "event",
     "foreach", "format", "function", "gag", "grep", "help", "highlight", "history", "if",
     "info", "kill", "line", "local", "log", "loop", "macro", "math", "message", "nop",
-    "path", "pathdir", "read", "return", "run", "send", "session", "showme", "split",
+    "path", "pathdir", "read", "reconnect", "return", "run", "send", "session", "showme",
+    "split",
     "ssl", "substitute", "switch", "system", "tab", "textin", "ticker", "unaction", "unalias",
     "undelay", "unevent", "unfunction", "ungag", "unhighlight", "unmacro",
     "unsubstitute", "untab", "unticker", "unvariable", "variable", "while", "write",
@@ -74,6 +75,7 @@ impl App {
                 self.quit = true;
             }
             "zap" => self.disconnect(false),
+            "reconnect" => self.cmd_reconnect(),
             "session" => self.cmd_session(rest, depth),
             "ssl" => self.cmd_ssl(rest, depth),
             "run" => self.cmd_run(rest, depth),
@@ -1500,6 +1502,31 @@ impl App {
 
     // ---- session / config / io ------------------------------------------
 
+    /// Go back to the last session without retyping how it was made.
+    ///
+    /// Deliberately independent of `#config {reconnect}`: asking for it once,
+    /// now, is a different thing from arming it to happen on its own, and the
+    /// player who has not armed anything is exactly the one who most wants a
+    /// short way to say "again".
+    fn cmd_reconnect(&mut self) {
+        // A pipe session reconnects by spawning a process again. The command is
+        // the player's own and cannot be edited by the server — but *when* it
+        // runs would be the server's to choose if a trigger could call this, and
+        // "server decides when judytin spawns processes" is the thing the gate
+        // exists to prevent. Sockets are not gated: reopening one costs the
+        // server the same connection it just dropped.
+        if matches!(self.last_session, Some(crate::app::Recipe::Pipe { .. }))
+            && !self.guard_local_effects("#reconnect")
+        {
+            return;
+        }
+        self.cancel_reconnect();
+        if let Some(how) = self.last_session.clone() {
+            self.info(&format!("reconnecting to {} ...", how.describe()));
+        }
+        self.reconnect(true);
+    }
+
     fn cmd_session(&mut self, rest: &str, depth: u32) {
         let (name, r2) = get_arg(rest);
         let (host, r3) = get_arg(r2);
@@ -1591,10 +1618,12 @@ impl App {
         match opt.to_lowercase().replace('_', " ").as_str() {
             "" => {
                 let msg = format!(
-                    "config: speedwalk {}, echo {}, verbatim {}, repeat char {}, packet patch {}",
+                    "config: speedwalk {}, echo {}, verbatim {}, reconnect {}, \
+                     repeat char {}, packet patch {}",
                     onoff(self.speedwalk_on),
                     onoff(self.echo_on),
                     onoff(self.verbatim_on),
+                    onoff(self.reconnect_on),
                     self.repeat_char,
                     self.packet_patch.as_secs_f64(),
                 );
@@ -1611,6 +1640,19 @@ impl App {
             "verbatim" => {
                 self.verbatim_on = on;
                 self.info(&format!("ok. verbatim is {}", onoff(on)));
+            }
+            "reconnect" => {
+                self.reconnect_on = on;
+                if on {
+                    self.info(
+                        "ok. after a drop judytin will keep trying the last session — \
+                         but it cannot tell the server dying from you typing the game's \
+                         own quit, so #zap is how you say you meant to leave.",
+                    );
+                } else {
+                    self.cancel_reconnect();
+                    self.info("ok. reconnect is off");
+                }
             }
             "trigger shell" => {
                 self.trigger_shell = on;
@@ -1796,6 +1838,8 @@ impl App {
   #5 {commands} repeats 5 times, ! recalls history, tab completes words\r
 \r
   \x1b[1msession\x1b[0m   #session {name} {host} {port}, #zap, #end\r
+            #reconnect  return to the last session, whatever the transport\r
+            #config {reconnect} {on}  keep retrying after a server-side drop\r
             #ssl {name} {host} {port} telnet-over-TLS (pin kept in ~/.judytin_known_hosts)\r
             #run {name} {ssh -T you@host} any command as the byte pipe\r
   \x1b[1mtriggers\x1b[0m  #alias #action #highlight #substitute #gag #variable #function\r

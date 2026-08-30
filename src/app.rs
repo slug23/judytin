@@ -37,6 +37,30 @@ pub enum Ev {
     NetDiag(u64, String),
 }
 
+/// How to get back to where we were.
+///
+/// Kept after the socket goes, which is the whole point: a disconnect throws
+/// away the connection but not the knowledge of how it was made, so
+/// `#reconnect` and the automatic retry have somewhere to aim without the
+/// player retyping a `#session` line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Recipe {
+    Tcp { host: String, port: u16 },
+    Tls { host: String, port: u16 },
+    Pipe { label: String, command: String, ssh: Option<String> },
+}
+
+impl Recipe {
+    /// How it reads back to the player, in the words they used to make it.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Recipe::Tcp { host, port } => format!("{}:{}", host, port),
+            Recipe::Tls { host, port } => format!("{}:{} (tls)", host, port),
+            Recipe::Pipe { label, .. } => format!("{} (pipe)", label),
+        }
+    }
+}
+
 #[allow(clippy::large_enum_variant)] // single instance, always the Split arm in practice
 pub enum Ui {
     Split(SplitUi),
@@ -113,6 +137,16 @@ pub struct App {
     pub(crate) pathdirs: BTreeMap<String, String>,
     conn: Option<Conn>,
     conn_id: u64,
+    /// The last connection judytin made, kept across disconnects.
+    pub(crate) last_session: Option<Recipe>,
+    /// Opt-in. Off by default because judytin cannot tell the server crashing
+    /// from you typing the game's own quit command — both are just a socket
+    /// closing — so arming this is a choice the player makes knowing that.
+    pub(crate) reconnect_on: bool,
+    /// When the next automatic attempt is due, if one is pending.
+    retry_at: Option<Instant>,
+    /// Attempts since the last success, which is what stretches the backoff.
+    retry_n: u32,
     pub(crate) host: String,
     pub(crate) port: u16,
     telnet: Telnet,
@@ -189,6 +223,10 @@ impl App {
             pathdirs: default_pathdirs(),
             conn: None,
             conn_id: 0,
+            last_session: None,
+            reconnect_on: false,
+            retry_at: None,
+            retry_n: 0,
             host: String::new(),
             port: 0,
             telnet: Telnet::new(),
@@ -428,7 +466,12 @@ impl App {
         self.info(&format!("trying {}:{} ...", host, port));
         self.conn_id += 1;
         match net::connect_tcp(host, port, self.conn_id, self.tx.clone()) {
-            Ok(conn) => self.finish_connect(conn, host, port),
+            Ok(conn) => self.finish_connect(
+                conn,
+                host,
+                port,
+                Recipe::Tcp { host: host.to_string(), port },
+            ),
             Err(e) => self.info(&format!("connection to {}:{} failed: {}", host, port, e)),
         }
     }
@@ -449,7 +492,12 @@ impl App {
                     }
                     Pin::Known => self.info("server certificate matches the pinned one"),
                 }
-                self.finish_connect(conn, host, port);
+                self.finish_connect(
+                    conn,
+                    host,
+                    port,
+                    Recipe::Tls { host: host.to_string(), port },
+                );
             }
             Err(e) => self.info(&format!("tls connection to {}:{} failed: {}", host, port, e)),
         }
@@ -475,14 +523,28 @@ impl App {
         self.info(&format!("running {} ...", command));
         self.conn_id += 1;
         match net::connect_pipe(command, ssh_dest, self.conn_id, self.tx.clone()) {
-            Ok(conn) => self.finish_connect(conn, label, 0),
+            Ok(conn) => self.finish_connect(
+                conn,
+                label,
+                0,
+                Recipe::Pipe {
+                    label: label.to_string(),
+                    command: command.to_string(),
+                    ssh: ssh_dest.map(str::to_string),
+                },
+            ),
             Err(e) => self.info(&format!("cannot run '{}': {}", command, e)),
         }
     }
 
-    fn finish_connect(&mut self, conn: Conn, host: &str, port: u16) {
+    fn finish_connect(&mut self, conn: Conn, host: &str, port: u16, how: Recipe) {
         let kind = conn.kind();
         self.conn = Some(conn);
+        // Remember how we got here before anything can go wrong with it, and
+        // treat arriving as proof the backoff has done its job.
+        self.last_session = Some(how);
+        self.retry_at = None;
+        self.retry_n = 0;
         self.host = host.to_string();
         self.port = port;
         self.telnet = Telnet::new();
@@ -509,7 +571,74 @@ impl App {
         self.conn.is_some()
     }
 
+    /// How long to wait before attempt `n`. Grows to half a minute and stays
+    /// there — a server being rebuilt can be gone for a while, and hammering
+    /// it helps nobody.
+    fn backoff(n: u32) -> Duration {
+        Duration::from_secs(match n {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            4 => 16,
+            _ => 30,
+        })
+    }
+
+    /// Schedule another attempt after a drop judytin did not ask for.
+    ///
+    /// Never gives up: the retry is what the player armed, and stopping after
+    /// some arbitrary count would abandon them at the moment a long rebuild
+    /// finishes. `#zap` ends it, and every attempt says so.
+    pub(crate) fn arm_reconnect(&mut self) {
+        if !self.reconnect_on || self.last_session.is_none() {
+            return;
+        }
+        let wait = Self::backoff(self.retry_n);
+        self.retry_at = Some(Instant::now() + wait);
+        self.info(&format!(
+            "reconnecting in {}s — #zap to stop",
+            wait.as_secs()
+        ));
+    }
+
+    pub(crate) fn cancel_reconnect(&mut self) {
+        self.retry_at = None;
+        self.retry_n = 0;
+    }
+
+    /// Try the stored recipe once. `manual` is #reconnect, which runs whatever
+    /// the config says and does not schedule a follow-up; the automatic path
+    /// arms the next attempt when this one does not take.
+    pub(crate) fn reconnect(&mut self, manual: bool) {
+        let Some(how) = self.last_session.clone() else {
+            self.info("no session to return to — #session, #ssl or #run first");
+            return;
+        };
+        if self.conn.is_some() {
+            self.info("already connected — #zap first");
+            return;
+        }
+        self.retry_at = None;
+        if !manual {
+            self.retry_n = self.retry_n.saturating_add(1);
+        }
+        match how {
+            Recipe::Tcp { host, port } => self.connect(&host, port),
+            Recipe::Tls { host, port } => self.connect_tls(&host, port),
+            Recipe::Pipe { label, command, ssh } => {
+                self.start_pipe(&label, &command, ssh.as_deref())
+            }
+        }
+        if self.conn.is_none() && !manual {
+            self.arm_reconnect();
+        }
+    }
+
     pub fn disconnect(&mut self, quiet: bool) {
+        // The player asked to leave. Whatever retry was pending is no longer
+        // wanted, and this is the only signal judytin gets that says so.
+        self.cancel_reconnect();
         if let Some(mut conn) = self.conn.take() {
             conn.shutdown();
             if !quiet {
@@ -532,6 +661,9 @@ impl App {
         {
             self.info("send failed — connection lost");
             self.disconnect(true);
+            // disconnect() clears the retry because it is normally the player
+            // leaving; here the connection left, so put it back.
+            self.arm_reconnect();
         }
     }
 
@@ -614,7 +746,15 @@ impl App {
                         "SESSION DISCONNECTED",
                         &["judytin".to_string(), host.clone(), host, port],
                     );
-                    if matches!(self.ui, Ui::Dumb) {
+                    // The socket went away without judytin asking. This is the
+                    // case worth chasing — and the one judytin cannot tell from
+                    // the player typing the game's own quit, so it only chases
+                    // when asked to.
+                    self.arm_reconnect();
+                    // A piped run ends when the connection does, because there
+                    // is nothing left to type. Unless a retry is pending: then
+                    // there is, and the player said so.
+                    if matches!(self.ui, Ui::Dumb) && self.retry_at.is_none() {
                         self.quit = true;
                     }
                 }
@@ -687,7 +827,7 @@ impl App {
     pub fn next_deadline(&self) -> Option<Instant> {
         let tick = self.tickers.values().map(|t| t.next).min();
         let delay = self.delays.values().map(|t| t.next).min();
-        [tick, delay, self.flush_deadline]
+        [tick, delay, self.flush_deadline, self.retry_at]
             .into_iter()
             .flatten()
             .min()
@@ -700,6 +840,11 @@ impl App {
             && d <= Instant::now()
         {
             self.flush_partial();
+        }
+        if let Some(d) = self.retry_at
+            && d <= Instant::now()
+        {
+            self.reconnect(false);
         }
         let now = Instant::now();
         let due: Vec<(String, String, bool)> = self

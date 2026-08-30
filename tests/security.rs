@@ -231,6 +231,63 @@ fn the_gate_still_lets_the_user_run_things_themselves() {
     assert!(created, "a user-typed #system was wrongly refused:\n{}", out.stdout);
 }
 
+#[test]
+fn a_trigger_cannot_make_reconnect_respawn_a_process() {
+    // #reconnect returns to the last session. When that session is a pipe,
+    // returning to it means spawning a process again — and while the command
+    // line is the player's own and beyond the server's reach, *when* it runs
+    // would be the server's to choose if a trigger could fire this. "The mud
+    // decides when judytin spawns processes" is the shape the gate refuses, so
+    // a pipe recipe is gated exactly like #run.
+    //
+    // The pipe here is both transport and attacker: what a subprocess prints is
+    // server text like any other.
+    let m = marker("respawn");
+    let port = hostile_server(vec![]);
+    let out = run(
+        port,
+        &format!(
+            "#zap\n\
+             #action {{spawn now}} {{#reconnect}}\n\
+             #run {{probe}} {{sh -c 'echo ran >> {}; echo spawn now; sleep 3'}}\n\
+             #delay {{2}} {{#end}}\n",
+            m.display()
+        ),
+    );
+    let ran = std::fs::read_to_string(&m).unwrap_or_default();
+    let _ = std::fs::remove_file(&m);
+    assert_eq!(
+        ran.lines().count(),
+        1,
+        "the process ran {} times — a trigger re-spawned it through #reconnect:\n{}",
+        ran.lines().count(),
+        out.stdout
+    );
+    assert!(
+        out.says("#reconnect refused"),
+        "expected the gate to say why it refused:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn a_trigger_may_still_reopen_a_socket() {
+    // The gate is about touching the machine, not about reconnecting. A socket
+    // session costs the server only the connection it just dropped, so a
+    // trigger reopening one is not the thing being prevented — and refusing it
+    // would make the gate look arbitrary.
+    let port = hostile_server(vec!["come back\r\n".to_string()]);
+    let out = run(
+        port,
+        "#action {come back} {#zap;#reconnect}\n#delay {2} {#end}\n",
+    );
+    assert!(
+        !out.says("#reconnect refused"),
+        "a socket reconnect was gated as if it touched the machine:\n{}",
+        out.stdout
+    );
+}
+
 // ---- crashes and exhaustion -------------------------------------------
 
 #[test]

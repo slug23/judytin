@@ -236,6 +236,125 @@ fn a_tls_mud_that_hangs_up_bluntly_still_says_goodbye_plainly() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A mock that answers `serve` connections in turn and drops the first after a
+/// moment — a server restarting under the player, which is what reconnect is
+/// for. `count` is how many times it was actually reached.
+fn spawn_restarting_mock(
+    serve: u32,
+    drop_first_after: Duration,
+) -> (u16, Arc<Mutex<u32>>, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let count = Arc::new(Mutex::new(0u32));
+    let c2 = count.clone();
+    let handle = std::thread::spawn(move || {
+        for n in 0..serve {
+            let Ok((mut sock, _)) = listener.accept() else { return };
+            *c2.lock().unwrap() += 1;
+            let _ = sock.write_all(format!("session {} up\r\n", n + 1).as_bytes());
+            if n == 0 {
+                std::thread::sleep(drop_first_after);
+            } else {
+                std::thread::sleep(Duration::from_millis(900));
+            }
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    (port, count, handle)
+}
+
+#[test]
+fn a_dropped_session_is_not_chased_unless_asked() {
+    let (port, count, server) = spawn_restarting_mock(1, Duration::from_millis(300));
+    let out = run_judytin_with(&["--dumb", "127.0.0.1", &port.to_string()], "#config\n", &[]);
+    server.join().unwrap();
+    assert!(out.contains("reconnect off"), "default is not off:\n{}", out);
+    assert!(
+        !out.contains("reconnecting in"),
+        "chased a drop nobody asked it to chase:\n{}",
+        out
+    );
+    assert_eq!(*count.lock().unwrap(), 1, "connected more than once");
+}
+
+#[test]
+fn an_armed_session_comes_back_after_the_server_drops_it() {
+    let (port, count, server) = spawn_restarting_mock(2, Duration::from_millis(400));
+    let out = run_judytin_with(
+        &["--dumb", "--offline"],
+        &format!(
+            "#config {{reconnect}} {{on}}\n\
+             #session {{mud}} {{127.0.0.1}} {{{port}}}\n\
+             #delay {{3.0}} {{#end}}\n"
+        ),
+        &[],
+    );
+    server.join().unwrap();
+    assert!(out.contains("session 1 up"), "never reached the mock:\n{}", out);
+    assert!(out.contains("reconnecting in 1s"), "no retry announced:\n{}", out);
+    assert!(out.contains("session 2 up"), "did not come back:\n{}", out);
+    assert_eq!(*count.lock().unwrap(), 2, "should have connected twice");
+}
+
+#[test]
+fn zap_means_the_player_left_and_is_not_chased() {
+    let (port, count, server) = spawn_restarting_mock(1, Duration::from_millis(2000));
+    let out = run_judytin_with(
+        &["--dumb", "--offline"],
+        &format!(
+            "#config {{reconnect}} {{on}}\n\
+             #session {{mud}} {{127.0.0.1}} {{{port}}}\n\
+             #delay {{0.6}} {{#zap}}\n\
+             #delay {{2.5}} {{#end}}\n"
+        ),
+        &[],
+    );
+    server.join().unwrap();
+    // Armed, but #zap is the one thing that says "I meant to go".
+    assert!(out.contains("connection closed (zap)"), "never zapped:\n{}", out);
+    assert!(
+        !out.contains("reconnecting in"),
+        "chased the player out the door:\n{}",
+        out
+    );
+    assert_eq!(*count.lock().unwrap(), 1, "reconnected after a zap");
+}
+
+#[test]
+fn reconnect_returns_to_the_last_session_without_retyping_it() {
+    let (port, count, server) = spawn_restarting_mock(2, Duration::from_millis(2000));
+    // Config still off: asking once is not the same as arming it.
+    let out = run_judytin_with(
+        &["--dumb", "--offline"],
+        &format!(
+            "#session {{mud}} {{127.0.0.1}} {{{port}}}\n\
+             #delay {{0.6}} {{#zap}}\n\
+             #delay {{1.2}} {{#reconnect}}\n\
+             #delay {{2.6}} {{#end}}\n"
+        ),
+        &[],
+    );
+    server.join().unwrap();
+    assert!(out.contains("session 1 up"), "never reached the mock:\n{}", out);
+    assert!(
+        out.contains("reconnecting to 127.0.0.1:"),
+        "#reconnect did not say where it was going:\n{}",
+        out
+    );
+    assert!(out.contains("session 2 up"), "did not come back:\n{}", out);
+    assert_eq!(*count.lock().unwrap(), 2, "should have connected twice");
+}
+
+#[test]
+fn reconnect_without_a_session_says_so_rather_than_guessing() {
+    let out = run_judytin_with(&["--dumb", "--offline"], "#reconnect\n", &[]);
+    assert!(
+        out.contains("no session to return to"),
+        "invented a destination:\n{}",
+        out
+    );
+}
+
 #[test]
 fn scripting_engine_end_to_end() {
     let (port, server) = spawn_mock();

@@ -147,6 +147,25 @@ Three ways to reach a MUD, indistinguishable above the socket:
   standing in the middle, and appending the new key is the one thing not to
   do.
 
+### Coming back after a drop
+
+`#reconnect` returns to the last session — whatever transport it was, without
+retyping the `#session`, `#ssl` or `#run` line that made it.
+
+`#config {reconnect} {on}` makes judytin do that by itself after a drop it
+did not ask for, retrying at 1, 2, 4, 8, 16 then every 30 seconds for as long
+as it takes. It is off by default for a reason worth knowing: **judytin cannot
+tell the server dying from you typing the game's own quit command.** Both are
+just a socket closing, and the quit command differs from MUD to MUD. `#zap` is
+how you say you meant to leave — it stops any pending retry — and every
+attempt reminds you of that.
+
+One asymmetry, deliberate: a trigger may fire `#reconnect` for a socket
+session, but not for a pipe. Returning to a pipe means spawning a process
+again, and while the command line is yours and beyond the server's reach,
+letting server text choose *when* it runs is the thing
+[`tests/security.rs`](tests/security.rs) exists to prevent.
+
 ## What it does under the hood
 
 - **Split screen** the way tt++ does it: a VT100 scroll region for output, a
