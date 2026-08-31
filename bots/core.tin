@@ -1,0 +1,276 @@
+#nop ── core.tin ── the part of a bot that has no class ─────────────────
+#nop
+#nop Read once, before any session exists. Everything here is shared by the
+#nop whole crew, which works because judytin runs a trigger in the focus of
+#nop the session whose line set it off: one #action serves four characters,
+#nop and $session tells it which one it is speaking for.
+#nop
+#nop Per-character state is therefore keyed by session name — $hp[$session],
+#nop never $hp — because actions, variables, functions and tickers are all
+#nop global to the client while connections are not. Class files set those
+#nop keyed variables. They must not define an action or a function, because
+#nop those are keyed by name and would replace this file's for everyone.
+
+#nop ── quiet ──────────────────────────────────────────────────────────
+#nop Four characters reporting hit points every round would otherwise bury
+#nop the game under judytin's own bookkeeping.
+#message {variable} {off}
+#message {math} {off}
+
+#nop ── vitals ─────────────────────────────────────────────────────────
+#nop judymud reports the same numbers twice in different shapes. This is the
+#nop bracketed line, which any client can match.
+#action {[%1/%2hp %3/%4m %5/%6v]} {#variable {hp[$session]} {%1};#variable {maxhp[$session]} {%2};#variable {mana[$session]} {%3};#variable {maxmana[$session]} {%4};#variable {move[$session]} {%5};@panic{}}
+
+#nop And this is the status prompt, which is where the gold is and which no
+#nop #action can ever see, because a prompt is never terminated. #prompt is
+#nop the only trigger kind that reaches it.
+#nop
+#nop The trailing `>` is load-bearing. Declaring the prompt is also what
+#nop lets judytin take it off the front of a line the server wrote in the
+#nop same packet as its next message, and it can only cut where the pattern
+#nop ends — without the `>` every capture below would start with one.
+#prompt {%1/%2hp %3/%4m %5g>} {#variable {hp[$session]} {%1};#variable {maxhp[$session]} {%2};#variable {mana[$session]} {%3};#variable {maxmana[$session]} {%4};#variable {gold[$session]} {%5}}
+
+#nop Percentages, as integers, guarded against the division by zero that
+#nop happens for the one round before any vitals line has arrived.
+#function {hppct} {#if {$maxhp[$session] > 0} {#math {r} {$hp[$session] * 100 / $maxhp[$session]}} {#local {r} {100}};#return {$r}}
+#function {manapct} {#if {$maxmana[$session] > 0} {#math {r} {$mana[$session] * 100 / $maxmana[$session]}} {#local {r} {0}};#return {$r}}
+
+#nop Anyone badly hurt does something about it, according to what they are.
+#nop This lives here with the vitals action rather than in cleric.tin because
+#nop actions are keyed by their pattern: a second #action on the vitals line
+#nop would not add a handler, it would replace this one.
+#function {panic} {#if {@hppct{} > 40} {#return {}};#if {"$heal[$session]" != "" && @manapct{} > 15} {cast '$heal[$session]' $session} {#showme {judytin: $session is at @hppct{}% and cannot heal}};#return {}}
+
+#nop ── login, and logging back in ──────────────────────────────────────
+#nop $login[<session>] is set by crew.local.tin: `guest <name> <class>` the
+#nop first time, `resume <name> <key>` afterwards. A judymud resume key *is*
+#nop the character, so that file is git-ignored and 0600 and this one holds
+#nop no names at all.
+#nop
+#nop $sent[$session] is what stops judytin-s66: if the server rejects the
+#nop answer and asks again, the trigger answers once and then stays quiet
+#nop rather than hammering somebody else's machine several thousand times a
+#nop second. It has caught a real re-prompt already — a name taken by the
+#nop previous run — and said so instead of looping.
+#action {By what name do you wish to be known} {#if {"$sent[$session]" == ""} {#variable {sent[$session]} {yes};$login[$session]} {#showme {judytin: $session was asked for a name twice — not answering again}}}
+
+#nop `guest` works exactly once. The moment judymud hands over the resume
+#nop key, that becomes this character's login — otherwise the first server
+#nop restart locks the whole crew out: SESSION CONNECTED re-sends the stored
+#nop login, `guest` finds the character already there, and four characters
+#nop that were mid-fight never get back in. Observed doing exactly that.
+#nop
+#nop This is allowed and the file-writing version is not, which is the line
+#nop the second security invariant draws. The key is server text: it arrives
+#nop escaped, it is kept escaped in the variable, and it is unescaped once
+#nop when it is sent back at the door. It never becomes a command and it
+#nop never reaches the disk.
+#nop The name comes off the same line rather than from $session. They are
+#nop the same thing when crew.tin opened the session — it names each session
+#nop after its character — but a bot should not break because someone opened
+#nop a session by hand and called it something else.
+#action {`resume %1 %2` brings you back} {#variable {login[$session]} {resume %1 %2}}
+
+#nop A crew is created once. The second time, `guest` finds the character
+#nop already there and the door says so — which is a dead end unless someone
+#nop explains it, so this does.
+#nop
+#nop judytin cannot save the resume key for you, and should not be able to.
+#nop The key arrives as server text, so a trigger that reads it is
+#nop server-driven, and #write is refused for exactly that execution. That is
+#nop the second security invariant working: a MUD must never be able to make
+#nop the client write a file. It means saving a credential is a job for a
+#nop person, on purpose.
+#action {That name is already someone's} {#showme {judytin: $session already exists. Either run bots/newcrew.sh for a fresh crew, or put that character's `resume <name> <key>` line into bots/crew.local.tin as its $login.}}
+
+#nop SESSION CONNECTED fires on a reconnect as well as on the first connect,
+#nop so clearing the guard here is the whole of judytin's automatic re-login.
+#nop judymud restarts often while it is being worked on, and the crew comes
+#nop back by itself.
+#event {SESSION CONNECTED} {#variable {sent[$session]} {};#variable {ingame[$session]} {};#showme {judytin: $session connected}}
+#event {SESSION DISCONNECTED} {#variable {ingame[$session]} {};#showme {judytin: $session lost the server — reconnect will keep trying}}
+
+#nop Connected is not the same as playing, and the difference is not
+#nop cosmetic. A reconnected session sits at the door with a socket open, so
+#nop $connected is 1 while the only thing that will be understood is a name.
+#nop The hunt ticker did not know that and sent `kill believer` at the login
+#nop prompt, judymud answered "Names are 3-16 letters, nothing else", and
+#nop after enough of that the door shut the crew out for several minutes —
+#nop which was judymud defending itself correctly against a bot of mine.
+#nop
+#nop So the crew tracks being in the game separately, on the two lines that
+#nop only appear once a character is actually in the world.
+#action {Welcome, %1. Type help} {#variable {ingame[$session]} {yes};@joined{}}
+#action {Welcome back} {#variable {ingame[$session]} {yes};#showme {judytin: $session resumed};@joined{}}
+
+#nop One place that answers "may this session be sent a game command".
+#nop Connected is not the same as playing: a reconnected session sits at the
+#nop door with a socket open, so $connected is 1 while the only thing that
+#nop will be understood is a name. The hunt ticker did not know that once and
+#nop sent `kill believer` at the login prompt until judymud shut the door on
+#nop the crew for several minutes, which was judymud defending itself
+#nop correctly against a bot of mine.
+#function {playing} {#if {$connected == 1 && "$ingame[$session]" == "yes"} {#return {1}};#return {0}}
+
+#nop Assembling on arrival rather than on a stopwatch. A script that said
+#nop "group at eighteen seconds" grouped nobody the run the server happened
+#nop to be restarting then, and the four characters spent three minutes
+#nop fighting alone and sharing nothing. Reacting to being in the world
+#nop instead means a restart costs the crew a few seconds and no more.
+#nop
+#nop $session must be captured into a local first. Inside #$leader {...} the
+#nop focus has already moved, so $session there is the leader — the name of
+#nop the character that just arrived would be lost exactly when it is needed.
+#function {joined} {#local {me} {$session};wimpy $wimpy[$me];#if {"$buffspell[$me]" != ""} {cast '$buffspell[$me]'};#if {"$isleader[$me]" == ""} {follow $leader} {@rally{}};#return {}}
+
+#nop The leader arriving is the other half. Everyone else's follow points at
+#nop a character that was not there a moment ago, so they are told to follow
+#nop again rather than being left trailing nobody.
+#function {rally} {#all {#if {@playing{} == 1 && "$isleader[$session]" == ""} {follow $leader}};#return {}}
+
+#nop Grouping happens on judymud's own confirmation, not on judytin's guess.
+#nop
+#nop A first version had the arriving character send `follow` and then ask
+#nop the leader to `group` it in the next breath. Those two commands travel
+#nop on two different sockets and the group regularly arrived first: judymud
+#nop answered "the cleric is not following you." six times in one run, and
+#nop crew never formed. Waiting for the server to say the follow took removes
+#nop the race — the line only exists once the thing it depends on happened.
+#nop
+#nop The name is captured from the front of the line, which is only safe
+#nop because the #prompt above declared what the prompt looks like. Before
+#nop that, %1 came back as "30/30hp 12/12m 0g> Bob" whenever judymud
+#nop wrote its prompt and this message in one packet — intermittently, which
+#nop is harder to find than always. This crew grouped by sweeping the whole
+#nop roster for a while to avoid it.
+#action {%1 starts following you} {#if {"$isleader[$session]" != ""} {group %1}}
+
+#nop The leader arriving collects whoever is already there. Starting at 2
+#nop because the leader is $roster[1] and grouping yourself is not a thing
+#nop worth finding out the meaning of.
+#function {regroup} {#list {roster} {size} {n};#loop {2} {$n} {i} {group $roster[+$i]};#return {}}
+
+#nop ── learning what you can actually cast ─────────────────────────────
+#nop A level-1 cleric knows `cure light` and nothing else worth casting: its
+#nop attack spell arrives at level 2 and its armor at level 3. Rather than
+#nop write a level table that would go stale the moment the game is balanced
+#nop again, the crew finds out by trying — the refusal is free, costs no mana
+#nop and no round, and names both the spell and the level it needs.
+#nop
+#nop So each caster reaches for its spell, is told no, falls back to swinging
+#nop at things, and reaches for it again the moment it gains a level.
+#action {You are not yet learned enough for %1 (level %2)} {#if {"%1" == "$atkspell[$session]"} {#variable {atk[$session]} {kill};#showme {judytin: $session cannot cast %1 until level %2 — melee for now}};#if {"%1" == "$buffspell[$session]"} {#variable {buffready[$session]} {}}}
+
+#nop A level is the moment to try everything that was refused before.
+#action {You gain a level} {#showme {judytin: LEVEL for $session};@rearm{}}
+#function {rearm} {#if {"$atkspell[$session]" != ""} {#variable {atk[$session]} {cast '$atkspell[$session]'}};#variable {buffready[$session]} {yes};#return {}}
+
+#nop ── the fight ───────────────────────────────────────────────────────
+#nop One shared list of things worth hitting. Items are brace-separated:
+#nop {a}{b}{c}. A semicolon list would be a single item.
+#nop
+#nop Deliberately no guard and no cop. Angering one is judymud-06g, a death
+#nop loop at the respawn point that no bot gets out of.
+#nop
+#nop Only what the training ground holds, and these are the keywords the
+#nop game answers to, not what it prints: the mob shown as "Sun the Jackass
+#nop is standing here" is killed as `jackass`.
+#nop A longer list of names from all over Midgaard is not more thorough, only
+#nop slower — with fifteen names and five of them present, most of every
+#nop sweep is "You do not see that here." and the misses are the budget.
+#list {prey} {create} {believer}{apprentice}{pilferer}{swordpupil}{jackass}{limo}{fido}
+
+#nop ── getting there, and getting back ─────────────────────────────────
+#nop In DIKU you can only follow someone standing next to you, so a
+#nop character that arrives while the leader is already out hunting can never
+#nop rejoin by following: judymud says "They are not here." and that is all.
+#nop A cleric spent four entire runs stranded in the temple, swinging at a
+#nop safe room forty-six times a run and holding at 12 experience while the
+#nop other three reached levels 2 and 3.
+#nop
+#nop So being in the wrong place is something to fix rather than to report.
+#nop The safe-room refusal is the signal — it can only mean this character is
+#nop somewhere it cannot fight — and `recall` makes the temple a known
+#nop starting point to walk the route from.
+#list {route} {create} {recall}{west}{south}
+#function {gotohunt} {#foreach {$route[%*]} {step} {$step};#return {}}
+#action {Something about this place refuses violence} {@gotohunt{}}
+
+#nop A tick attacks ONE name, not the whole list. The first version swung at
+#nop all fifteen every six seconds and judymud answered "You do not see that
+#nop here." two hundred and ten times in a three-minute run — sixty commands
+#nop a tick from four characters, which is rude to a server and no faster,
+#nop since only one of them can be in the room anyway.
+#nop
+#nop So each character keeps its own place in the list and moves on by one
+#nop each tick, wrapping at the end. It sweeps the same fifteen names, one
+#nop command at a time, and stops sweeping the moment it is in a fight.
+#nop
+#nop $prey[+$i] is a signed subscript resolved against the live list, so
+#nop adding a name to the list is all it takes to start hunting it. The whole
+#nop list at once is $prey[%*], which is what #foreach wants — but this walks
+#nop one name per tick on purpose, so the index is what it needs.
+#function {aim} {#list {prey} {size} {n};#math {i} {$aimat[$session] % $n + 1};#variable {aimat[$session]} {$i};#return {$prey[+$i]}}
+
+#nop Deliberately no "am I already fighting" flag. One was written, and it
+#nop was wrong: a mob that flees leaves the flag set, and that character
+#nop stops hunting for the rest of the run without saying anything. judymud
+#nop answers a redundant attack with one line — "You are already fighting!" —
+#nop which is a much better outcome than a bot that quietly stops. State that
+#nop can get stuck is worse than a command that is occasionally wasted.
+#action {corpse of %1 slumps to the ground} {get all from corpse}
+
+#function {engage} {#if {"$atk[$session]" == ""} {#return {}};$atk[$session] @aim{};#return {}}
+
+#nop A miss moves straight on to the next name instead of waiting for the
+#nop next tick. Without this a character tries one of fifteen names every six
+#nop seconds, and in a room holding two kinds of mob it lands about one try
+#nop in seven: a five-minute run killed nothing at all while the crew stood
+#nop in a room full of things to hit.
+#nop
+#nop This is judytin-s66's exact shape — a trigger whose answer provokes the
+#nop line that fires it again — so it is bounded on purpose. Five tries per
+#nop tick finds something in a populated room on the first or second, and
+#nop costs at most five commands per character per six seconds in an empty
+#nop one. The counter is reset by the tick, not by success, so the bound
+#nop cannot be defeated by a run of misses.
+#action {You do not see that here.} {#if {$tries[$session] < 5} {#math {t} {$tries[$session] + 1};#variable {tries[$session]} {$t};@engage{}}}
+
+#nop Rest when out of what makes you useful, fight when you have it back.
+#nop A caster with no mana is a very bad melee character, so it sits down.
+#nop A warrior has no mana to be out of, so it never does.
+#nop
+#nop The role test lives here rather than in the class files on purpose:
+#nop functions are global to the client, so a class file defining its own
+#nop @ready{} would silently replace this one for all four characters.
+#function {ready} {#if {"$role[$session]" == "warrior" || "$role[$session]" == "thief"} {#return {1}};#if {@manapct{} < 20} {#return {0}} {#return {1}}}
+
+#nop @playing{} keeps a broadcast off sessions that are down *and* off ones
+#nop that are up but still at the door. Without the first, a restart produces
+#nop a refusal per command per session every tick, burying the reconnect
+#nop messages. Without the second, the crew types game commands at a login
+#nop prompt until the server locks it out.
+#alias {crewfight} {#all {#if {@playing{} == 1} {#variable {tries[$session]} {0};#if {@ready{} == 1} {@engage{}} {rest}}}}
+
+#nop ── after the fight ─────────────────────────────────────────────────
+#action {You have died} {#showme {judytin: $session DIED}}
+
+#nop ── reading the screen ──────────────────────────────────────────────
+#nop A four-session crew is a wall of text. These make the parts a person
+#nop actually watches for stand out, and squeeze the parts that repeat.
+#nop
+#nop A substitute changes what is displayed and not what is matched, so the
+#nop vitals action above still sees the whole line while a reader sees four
+#nop short tags instead of four long ones.
+#substitute {[%1/%2hp %3/%4m %5/%6v]} {<%1hp %3m>}
+#highlight {You gain a level} {bold green}
+#highlight {You have died} {bold red}
+#highlight {You are not yet learned enough} {cyan}
+#gag {A Coke Machine is here.}
+
+#nop ── reports ─────────────────────────────────────────────────────────
+#alias {vitals} {#showme {$session ($role[$session]): hp $hp[$session]/$maxhp[$session] @hppct{}%  mana $mana[$session]/$maxmana[$session] @manapct{}%  atk $atk[$session]}}
+#alias {crewvitals} {#all {vitals}}
+#alias {crewscore} {#all {score}}

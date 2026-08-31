@@ -1,0 +1,23 @@
+#nop ── warrior.tin ── read while the warrior's session is current ──────
+#nop
+#nop A class file is bound to a session by *when* it is read, not by anything
+#nop written in it: $session is whichever session judytin is focused on at
+#nop the time, so crew.tin does `#session war ...` and then `#read` this, and
+#nop every setting below lands on the warrior alone.
+#nop
+#nop Class files set keyed variables and nothing else. Actions and functions
+#nop are keyed by name and global to the client, so one defined here would
+#nop belong to all four characters. core.tin owns those and branches on
+#nop $role[$session].
+
+#variable {role[$session]}      {warrior}
+#variable {atk[$session]}       {kill}
+#variable {atkspell[$session]}  {}
+#variable {heal[$session]}      {}
+#variable {buffspell[$session]} {}
+
+#nop Wimpy is the game's own auto-flee and beats anything a client can do:
+#nop it fires inside the combat round rather than after it. The warrior tanks,
+#nop so it stays in far longer than the people standing behind it.
+#variable {wimpy[$session]}     {12}
+#variable {isleader[$session]}    {yes}

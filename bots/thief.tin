@@ -1,0 +1,12 @@
+#nop ── thief.tin ── read while the thief's session is current ─────────
+#nop
+#nop Steel and shadow, not spells — which judymud will tell you in those
+#nop words if you ask a thief for its spell book.
+
+#variable {role[$session]}      {thief}
+#variable {atk[$session]}       {kill}
+#variable {atkspell[$session]}  {}
+#variable {heal[$session]}      {}
+#variable {buffspell[$session]} {}
+#variable {wimpy[$session]}     {20}
+#variable {isleader[$session]}    {}

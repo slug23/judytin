@@ -82,7 +82,7 @@ fn run(port: u16, script: &str) -> Run {
         .unwrap();
     let pid = child.id();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(20));
+        std::thread::sleep(Duration::from_secs(90));
         let _ = Command::new("kill").arg(pid.to_string()).status();
     });
     child
@@ -578,4 +578,221 @@ fn a_deeply_nested_expression_does_not_abort_the_process() {
         out.stdout
     );
     assert_ne!(out.status, Some(134), "process aborted:\n{}", out.stdout);
+}
+
+// ---- prompt triggers ----------------------------------------------------
+
+#[test]
+fn a_prompt_capture_cannot_become_a_command() {
+    // #prompt is a second door for server text to enter a script, and the
+    // prompt is the least-watched line on the screen. A payload parked in an
+    // unterminated prompt must be as inert as one in a finished line.
+    let m = marker("promptcap");
+    let port = hostile_server(vec![format!(
+        "\r\n30;#system touch {} #/56hp 12/30m 0g> ",
+        m.display()
+    )]);
+    let out = run(
+        port,
+        "#prompt {%1/%2hp} {#variable {hp} {%1};#showme vitals %1}\n#delay {2} {#end}\n",
+    );
+    assert_not_created(&m, "a `;` in a prompt capture started a new command");
+    assert!(out.did("vitals"), "prompt trigger did not run at all:\n{}", out.stdout);
+}
+
+#[test]
+fn a_prompt_trigger_cannot_touch_the_machine() {
+    // The prompt arrives unasked, on the server's schedule, and it is the one
+    // line a player never reads. A #prompt body is server-driven for the same
+    // reason an #action body is, and the gate must cover it.
+    let m = marker("promptexec");
+    let port = hostile_server(vec!["\r\n30/56hp 12/30m 0g> ".to_string()]);
+    let out = run(
+        port,
+        &format!(
+            "#prompt {{%1/%2hp}} {{#system touch {}}}\n#delay {{2}} {{#end}}\n",
+            m.display()
+        ),
+    );
+    assert_not_created(&m, "a #prompt body ran a shell command");
+    assert!(
+        out.did("refused") || out.did("trigger"),
+        "the refusal was silent, which teaches nobody:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn a_variable_cannot_name_a_command() {
+    // #$var picks which session runs something. It must never pick *what*
+    // runs: variables can hold server text, so allowing an expansion to
+    // resolve to a command name would let a MUD choose #system by getting a
+    // trigger to store the word.
+    let m = marker("varcmd");
+    let port = hostile_server(vec![format!("the word is system\r\n")]);
+    let out = run(
+        port,
+        &format!(
+            "#action {{the word is %1}} {{#variable {{picked}} {{%1}}}}\n\
+             #delay {{1.2}} {{#$picked {{touch {}}}}}\n\
+             #delay {{2.5}} {{#end}}\n",
+            m.display()
+        ),
+    );
+    assert_not_created(&m, "a variable expanded into a command name");
+    assert!(
+        out.did("no session named"),
+        "the refusal was silent:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn server_text_shaped_like_a_function_call_is_not_reported_as_one() {
+    // judytin now complains about @name{} naming no function. That must not
+    // become a way for a MUD to print client diagnostics, or worse to probe
+    // which functions a player has defined by watching what is complained
+    // about. `@` is in META, so server text arrives escaped and never reaches
+    // the call parser at all.
+    let port = hostile_server(vec!["Bob says '@secretfn{} @alsonope{}'\r\n".to_string()]);
+    let out = run(
+        port,
+        "#action {%1 says %2} {#variable {heard} {%2}}\n#delay {1.5} {#end}\n",
+    );
+    assert!(
+        !out.did("no function"),
+        "a server made judytin report on its own function table:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn a_filename_from_a_variable_still_cannot_be_reached_by_a_trigger() {
+    // #read, #write, #log and #textin now substitute their filename, so a
+    // variable can name a file. That must not become a way for a server to
+    // name one: a trigger stores server text in a variable and then a second
+    // trigger tries to write there.
+    let m = marker("filevar");
+    let port = hostile_server(vec![format!("the path is {}\r\n", m.display())]);
+    let out = run(
+        port,
+        "#action {the path is %1} {#variable {p} {%1};#write $p;#log append $p;#textin $p}\n\
+         #delay {2} {#end}\n",
+    );
+    assert_not_created(&m, "a trigger wrote to a filename it learned from the server");
+    assert!(
+        out.did("refused") || out.did("trigger"),
+        "the refusal was silent:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn a_trigger_answering_its_own_echo_is_bounded() {
+    // judytin-s66: a login trigger answers "By what name...", the server
+    // rejects the answer and asks again, and nothing anywhere stops the
+    // cycle. Reusing a taken name once produced roughly 350,000 round trips
+    // and a 354,740-line transcript in about forty seconds, and stopped only
+    // because the server reset the connection.
+    //
+    // judytin was doing exactly what it was told, across the network, where
+    // its own recursion limits cannot see it — and hammering a stranger's
+    // machine while doing it. The ceiling is on lines a trigger may send in a
+    // second, so a busy script is unaffected and a loop is not.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+    let s2 = seen.clone();
+    std::thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else { return };
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(50)));
+        // Held back so the trigger is certainly in place before the door
+        // speaks. Startup reads the script before connecting now, so this is
+        // determinism rather than a workaround — but a test of a runaway loop
+        // that quietly never starts the loop is worse than no test, and this
+        // one did exactly that until the pause was added.
+        std::thread::sleep(Duration::from_millis(700));
+        let _ = sock.write_all(b"By what name do you wish to be known?\r\n");
+        let mut buf = [0u8; 4096];
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while std::time::Instant::now() < deadline {
+            match sock.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let hits = buf[..n].iter().filter(|&&b| b == b'\n').count() as u32;
+                    *s2.lock().unwrap() += hits;
+                    // Refuse, and ask again. This is the whole attack.
+                    for _ in 0..hits {
+                        if sock
+                            .write_all(b"That name is taken.\r\nBy what name do you wish to be known?\r\n")
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+    });
+    let out = run(
+        port,
+        "#action {By what name do you wish to be known} {guest bob warrior}\n\
+         #delay {3.2} {#end}\n",
+    );
+    let n = *seen.lock().unwrap();
+    // Two and a half seconds at the ceiling is a few hundred, not a hundred
+    // thousand. The bound is what matters, not the exact number.
+    assert!(
+        n < 1000,
+        "trigger loop was not bounded: server saw {} answers\n{}",
+        n,
+        out.stdout
+    );
+    assert!(
+        out.did("sent") && out.did("lines in a second"),
+        "judytin throttled silently, which teaches nobody:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn a_comment_never_reaches_the_server() {
+    // A `;` in a #nop used to end the comment, and the rest of the prose ran
+    // as a command — which, connected, means it was sent to the MUD. Silent,
+    // because a nonsense game command produces nothing much. This is not an
+    // attack a server can mount, but it is the client leaking the player's
+    // own notes to one, which belongs in the same suite.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let h2 = heard.clone();
+    std::thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else { return };
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(1500)));
+        let _ = sock.write_all(b"Welcome.\r\n");
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = sock.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            h2.lock().unwrap().push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    });
+    run(
+        port,
+        "#nop the leader walks; everyone else follows it home\n\
+         #nop a note with; several; semicolons in it\n\
+         look\n\
+         #delay {1.5} {#end}\n",
+    );
+    let said = heard.lock().unwrap().clone();
+    assert!(
+        !said.contains("everyone else follows"),
+        "a comment was sent to the server: {:?}",
+        said
+    );
+    assert!(!said.contains("several"), "a comment was sent to the server: {:?}", said);
+    // The real command on the next line still went, so nothing was swallowed.
+    assert!(said.contains("look"), "the command after the comments was lost: {:?}", said);
 }

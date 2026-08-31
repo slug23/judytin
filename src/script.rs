@@ -11,6 +11,22 @@
 #[cfg(test)]
 use std::collections::BTreeMap;
 
+/// Whether what has been read so far is a `#nop`, whose argument is prose.
+///
+/// Only the exact word: `#no` is an ambiguous abbreviation (`#nop`, `#north`)
+/// and judytin would not resolve it either.
+fn is_comment(cur: &str) -> bool {
+    let t = cur.trim_start();
+    let Some(rest) = t.strip_prefix('#') else { return false };
+    let (word, after) = rest.split_at(rest.len().min(3));
+    if !word.eq_ignore_ascii_case("nop") {
+        return false;
+    }
+    // There has to be prose to protect. A bare `#nop` is the do-nothing
+    // command and `#nop;look` means two commands, as it always did.
+    after.starts_with(char::is_whitespace) && !after.trim().is_empty()
+}
+
 /// Split an input line into commands at top-level semicolons. Semicolons
 /// inside braces belong to the group; an escaped `\;` is data and is
 /// preserved (backslash included) for the sink to resolve.
@@ -37,7 +53,15 @@ pub fn split_commands(input: &str) -> Vec<String> {
                 depth = depth.saturating_sub(1);
                 cur.push(c);
             }
-            ';' if depth == 0 => {
+            // A `;` ends a command — unless the command is a comment, in
+            // which case it is prose and the rest of the line belongs to it.
+            //
+            // `#nop Only the leader walks; everyone else follows` used to run
+            // `everyone else follows` as a command, and connected that goes
+            // to the MUD. Three lines of one commented script leaked that way
+            // before it was noticed, and a fourth after the pattern was known
+            // — the failure is silent, so knowing about it does not help.
+            ';' if depth == 0 && !is_comment(&cur) => {
                 out.push(cur.trim().to_string());
                 cur = String::new();
             }
@@ -269,6 +293,32 @@ pub fn speedwalk(input: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_comment_keeps_its_semicolons() {
+        // `#nop` takes prose, and prose has semicolons in it. Splitting there
+        // used to run the second half as a command, which connected means
+        // sending it to the MUD — silently, since a failed game command looks
+        // like nothing much.
+        assert_eq!(
+            split_commands("#nop Only the leader walks; everyone else follows"),
+            vec!["#nop Only the leader walks; everyone else follows"]
+        );
+        assert_eq!(
+            split_commands("#nop one; two; three"),
+            vec!["#nop one; two; three"]
+        );
+        // A comment ends at the end of its line, not the end of the script.
+        assert_eq!(
+            split_commands("look;#nop a; b"),
+            vec!["look", "#nop a; b"]
+        );
+        // Only the exact word. `#no` is ambiguous between #nop and #north,
+        // and judytin would not resolve it either.
+        assert_eq!(split_commands("#no thing; look"), vec!["#no thing", "look"]);
+        // And a bare #nop is still a command that does nothing.
+        assert_eq!(split_commands("#nop;look"), vec!["#nop", "look"]);
+    }
 
     #[test]
     fn splits_on_semicolons() {

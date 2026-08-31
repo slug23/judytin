@@ -81,8 +81,15 @@ fn run_judytin_with(args: &[&str], script: &str, envs: &[(&str, &str)]) -> Strin
         .spawn()
         .unwrap();
     let pid = child.id();
+    // A backstop against a hung client, not a deadline for a slow one. Most
+    // of this suite drives a mock server on wall-clock timings, and dozens of
+    // those running at once on a busy machine stretch a two-second script
+    // well past what it looks like it needs. At fifteen seconds the whole
+    // suite failed under `cargo test`'s default parallelism while every test
+    // passed on its own — which is a broken test harness, not a broken
+    // client.
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(15));
+        std::thread::sleep(std::time::Duration::from_secs(90));
         let _ = Command::new("kill").arg(pid.to_string()).status();
     });
     child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
@@ -427,13 +434,18 @@ fn one_session_dropping_does_not_end_a_run_the_others_are_still_in() {
     //
     // Found for real — a four-character party against judymud lost three
     // healthy sessions nine seconds in because a fourth dropped.
-    let (pa, _ca, sa) = spawn_restarting_mock(1, Duration::from_millis(400));
+    // Both sessions are opened up front and `a` is dropped well after, so the
+    // order of the two events is fixed. Opening `b` on a #delay that fired at
+    // the same moment `a` died made this a coin flip: it failed about a third
+    // of the time, on unmodified code, for no reason to do with what it is
+    // testing.
+    let (pa, _ca, sa) = spawn_restarting_mock(1, Duration::from_millis(900));
     let (pb, sb) = spawn_named_mock("beta");
     let out = plain(&run_judytin_with(
         &["--dumb", "--offline"],
         &format!(
             "#session {{a}} {{127.0.0.1:{pa}}}\n\
-             #delay {{0.4}} {{#session {{b}} {{127.0.0.1:{pb}}}}}\n\
+             #session {{b}} {{127.0.0.1:{pb}}}\n\
              #delay {{1.6}} {{poke}}\n\
              #delay {{2.4}} {{#end}}\n"
         ),
@@ -850,7 +862,7 @@ fn dumb_mode_against_mock_mud() {
     // watchdog: kill the child if the test wedges
     let pid = child.id();
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(15));
+        std::thread::sleep(std::time::Duration::from_secs(90));
         let _ = Command::new("kill").arg(pid.to_string()).status();
     });
 
@@ -1214,4 +1226,936 @@ fn the_session_nobody_named_can_still_be_addressed() {
     let _ = sb.join();
     assert!(out.contains("[-] alpha heard poke"), "`#-` did not reach it:\n{}", out);
     assert!(!out.contains("beta heard poke"), "`#-` went to the wrong session:\n{}", out);
+}
+
+/// A mock that speaks judymud's shape: a status prompt carrying the numbers
+/// a bot needs, left unterminated the way a real server leaves it.
+///
+/// `quiet_ms` holds the greeting back so the piped script is registered
+/// first. Without it the test measures who won a race, not what the code does.
+fn spawn_status_prompt_mud(quiet_ms: u64) -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(quiet_ms));
+        sock.write_all(b"Welcome to mockmud\r\n30/56hp 12/30m 0g> ").unwrap();
+        let mut buf = [0u8; 1024];
+        let mut line = Vec::new();
+        let mut skip = 0usize;
+        loop {
+            let n = match sock.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            for &b in &buf[..n] {
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                if b == 255 {
+                    skip = 2;
+                    continue;
+                }
+                if b == b'\n' {
+                    let text = String::from_utf8_lossy(&line).trim().to_string();
+                    line.clear();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    // The leading \r\n completes the parked prompt into a
+                    // finished line, which is the case where the two trigger
+                    // kinds could double-claim the same bytes.
+                    let _ = sock.write_all(format!("\r\nyou said: {}\r\n", text).as_bytes());
+                    let _ = sock.write_all(b"7/56hp 1/30m 9g> ");
+                } else if b != b'\r' {
+                    line.push(b);
+                }
+            }
+        }
+    });
+    (port, handle)
+}
+
+/// How many times a trigger actually fired, ignoring judytin's own echo of
+/// the script that defined it. Counting raw occurrences instead is how three
+/// earlier assertions ended up measuring the test rather than the client.
+fn fires(out: &str, tag: &str) -> usize {
+    out.lines()
+        .filter(|l| !l.contains(">> ") && !l.contains("#ok."))
+        .filter(|l| l.contains(tag))
+        .count()
+}
+
+#[test]
+fn prompt_triggers_match_the_prompt_and_line_actions_do_not() {
+    let (port, _h) = spawn_status_prompt_mud(700);
+    // The same pattern registered both ways, against a prompt that is never
+    // completed into a line. Only #prompt can see it.
+    let script = "\
+#prompt {%1/%2hp %3/%4m} {#showme VITALS %1 %2 %3 %4}\n\
+#action {%1/%2hp %3/%4m} {#showme ACTIONFIRED}\n\
+#delay {1.6} {#end}\n";
+    let out = run_judytin(port, script);
+    assert!(out.contains("VITALS 30 56 12 30"), "prompt captures:\n{}", out);
+    assert_eq!(fires(&out, "ACTIONFIRED"), 0, "an action claimed a prompt:\n{}", out);
+}
+
+#[test]
+fn a_prompt_completed_into_a_line_fires_each_kind_once() {
+    let (port, _h) = spawn_status_prompt_mud(700);
+    // "poke" makes the server continue the parked prompt, so those bytes
+    // exist first as a prompt and then at the front of a completed line.
+    // Each kind gets its own half: #prompt matches the prompt, #action
+    // matches the message that followed it, and neither sees the other's.
+    let script = "\
+#prompt {%1/%2hp} {#showme PROMPTSAW %1}\n\
+#action {%1/%2hp %3/%4m %5g} {#showme LINEHP %1}\n\
+#action {you said: %1} {#showme LINESAW %1}\n\
+#delay {1.1} {poke}\n\
+#delay {2.2} {#end}\n";
+    let out = run_judytin(port, script);
+    // Two prompts are sent: the greeting's, and the one after the reply.
+    assert_eq!(fires(&out, "PROMPTSAW"), 2, "one fire per prompt:\n{}", out);
+    assert!(out.contains("PROMPTSAW 30"), "greeting prompt:\n{}", out);
+    assert!(out.contains("PROMPTSAW 7"), "prompt after the reply:\n{}", out);
+    assert_eq!(fires(&out, "LINESAW poke"), 1, "one fire per line:\n{}", out);
+    // This mock terminates its prompt with nothing behind it, so the whole
+    // buffer really is the prompt and an action still sees it — judytin
+    // cannot tell that from a message whose newline was simply late, and
+    // guessing wrong there loses messages, which is far worse. The case that
+    // matters, a prompt with a message glued behind it, is covered exactly by
+    // a_prompt_already_shown_is_not_glued_onto_the_next_line.
+    assert!(fires(&out, "LINEHP") <= 2, "the prompt fired repeatedly:\n{}", out);
+}
+
+#[test]
+fn a_prompt_trigger_does_not_fire_on_nothing() {
+    // Against the live mud a {%1} prompt trigger fired repeatedly with what
+    // looked like empty text. A server that sends only complete lines has no
+    // prompt at all, so any fire here is judytin inventing one.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        // Every write is a whole, terminated line. Nothing is ever parked.
+        for _ in 0..4 {
+            let _ = sock.write_all(b"The temple is quiet.\r\n");
+            std::thread::sleep(Duration::from_millis(120));
+        }
+        std::thread::sleep(Duration::from_millis(900));
+    });
+    let script = "#prompt {%1} {#showme FIRED<%1>}\n#delay {2.0} {#end}\n";
+    let out = run_judytin(port, script);
+    assert_eq!(
+        fires(&out, "FIRED<"),
+        0,
+        "prompt triggers fired with no prompt to match:\n{}",
+        out
+    );
+}
+
+#[test]
+fn a_parked_colour_sequence_is_not_a_prompt() {
+    // judymud colours its output, and a colour sequence can be left parked
+    // with no visible text behind it. Matching that as a prompt hands a bot
+    // an empty capture and fires its logic for no reason.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        // A finished line, then a bare colour change with nothing after it.
+        let _ = sock.write_all(b"The temple is quiet.\r\n\x1b[31m");
+        std::thread::sleep(Duration::from_millis(1200));
+    });
+    let script = "#prompt {%1} {#showme FIRED<%1>}\n#delay {2.0} {#end}\n";
+    let out = run_judytin(port, script);
+    assert_eq!(
+        fires(&out, "FIRED<"),
+        0,
+        "a colour sequence with no text was treated as a prompt:\n{}",
+        out
+    );
+}
+
+#[test]
+fn a_keyed_variable_write_expands_its_name() {
+    // $session exists so that one trigger can serve several characters. That
+    // only works if the *write* side expands too: storing into hp[$session]
+    // must reach hp[<this session>], not a single variable literally named
+    // "hp[$session]" that all four characters then share.
+    let script = "\
+#session alpha 127.0.0.1:1\n\
+#variable {role[$session]} {mage}\n\
+#showme BYNAME=[$role[alpha]] BYSESSION=[$role[$session]]\n\
+#end\n";
+    let out = run_judytin_with(&["--dumb", "--offline"], script, &[]);
+    assert!(out.contains("BYNAME=[mage]"), "write did not expand its key:\n{}", out);
+    assert!(out.contains("BYSESSION=[mage]"), "read did not agree with write:\n{}", out);
+}
+
+#[test]
+fn two_sessions_keep_separate_keyed_state() {
+    // The bug this guards: one shared variable meant the last character to
+    // report anything overwrote the other three.
+    let script = "\
+#session alpha 127.0.0.1:1\n\
+#variable {hp[$session]} {11}\n\
+#session beta 127.0.0.1:1\n\
+#variable {hp[$session]} {22}\n\
+#showme A=[$hp[alpha]] B=[$hp[beta]]\n\
+#end\n";
+    let out = run_judytin_with(&["--dumb", "--offline"], script, &[]);
+    assert!(out.contains("A=[11] B=[22]"), "sessions shared one variable:\n{}", out);
+}
+
+#[test]
+fn a_variable_can_be_set_to_nothing() {
+    // `#variable {x}` asks; `#variable {x} {}` sets empty. A script needs the
+    // second to say "this character has no healing spell" as a fact.
+    let script = "\
+#variable {heal} {cast cure}\n\
+#variable {heal} {}\n\
+#showme EMPTY=[$heal]\n\
+#variable {never}\n\
+#end\n";
+    let out = run_judytin_with(&["--dumb", "--offline"], script, &[]);
+    assert!(out.contains("EMPTY=[]"), "empty assignment did not take:\n{}", out);
+    assert!(out.contains("no variable {never}"), "querying stopped working:\n{}", out);
+}
+
+#[test]
+fn a_variable_can_name_the_session_to_run_in() {
+    // A roster of generated character names cannot be written into a script,
+    // so #$member {cmd} is the only way to drive one member of a crew.
+    let script = "\
+#session alpha 127.0.0.1:1\n\
+#session beta 127.0.0.1:1\n\
+#list {crew} {create} {alpha}{beta}\n\
+#variable {who} {alpha}\n\
+#$who {#showme PICKED-$session}\n\
+#$crew[-1] {#showme LAST-$session}\n\
+#$nosuch {#showme SHOULD-NOT-RUN}\n\
+#end\n";
+    let out = run_judytin_with(&["--dumb", "--offline"], script, &[]);
+    assert!(out.contains("PICKED-alpha"), "a variable did not name a session:\n{}", out);
+    assert!(out.contains("LAST-beta"), "a list subscript did not name a session:\n{}", out);
+    assert_eq!(fires(&out, "SHOULD-NOT-RUN"), 0, "an unknown name still ran:\n{}", out);
+    assert!(out.contains("no session named"), "an unknown name said nothing:\n{}", out);
+}
+
+/// A door that asks for a name, refuses whatever it is told, and asks again —
+/// then drops, and does the whole thing once more on the next connection.
+/// `heard` collects every line it was sent, across both connections.
+fn spawn_repromting_door() -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let h2 = heard.clone();
+    let handle = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((mut sock, _)) = listener.accept() else { return };
+            let _ = sock.set_read_timeout(Some(Duration::from_millis(1400)));
+            let _ = sock.write_all(b"By what name do you wish to be known?\r\n");
+            let mut buf = [0u8; 512];
+            let mut line = Vec::new();
+            let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+            while std::time::Instant::now() < deadline {
+                let n = match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                for &b in &buf[..n] {
+                    if b == b'\n' {
+                        let text = String::from_utf8_lossy(&line).trim().to_string();
+                        line.clear();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        h2.lock().unwrap().push(text);
+                        // Refuse it and ask again. A trigger that answers this
+                        // is the judytin-s66 loop.
+                        let _ = sock.write_all(
+                            b"That name is already someone's.\r\n\
+                              By what name do you wish to be known?\r\n",
+                        );
+                    } else if b != b'\r' {
+                        line.push(b);
+                    }
+                }
+            }
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    (port, heard, handle)
+}
+
+#[test]
+fn a_login_trigger_answers_once_per_connection_and_again_after_a_reconnect() {
+    // This is the pattern bots/core.tin logs in with, and both halves matter.
+    // SESSION CONNECTED must re-run the login after a drop, or a crew does not
+    // survive the server restarting. And the same trigger must NOT answer a
+    // re-prompt on the same connection, or it loops across the network where
+    // judytin's depth limits cannot see it — judytin-s66 managed roughly
+    // 350,000 round trips in forty seconds that way.
+    let (port, heard, server) = spawn_repromting_door();
+    let out = run_judytin_with(
+        &["--dumb", "--offline"],
+        &format!(
+            "#config {{reconnect}} {{on}}\n\
+             #variable {{login[mud]}} {{guest bob warrior}}\n\
+             #action {{By what name do you wish to be known}} \
+               {{#if {{\"$sent[$session]\" == \"\"}} \
+                  {{#variable {{sent[$session]}} {{yes}};$login[$session]}} \
+                  {{#showme {{REPROMPT-REFUSED}}}}}}\n\
+             #event {{SESSION CONNECTED}} {{#variable {{sent[$session]}} {{}}}}\n\
+             #session {{mud}} {{127.0.0.1:{port}}}\n\
+             #delay {{5.0}} {{#end}}\n"
+        ),
+        &[],
+    );
+    let _ = server.join();
+    let said = heard.lock().unwrap().clone();
+    let logins = said.iter().filter(|l| *l == "guest bob warrior").count();
+    assert_eq!(
+        logins, 2,
+        "expected one login per connection, got {} — {:?}\n{}",
+        logins, said, out
+    );
+    assert!(
+        fires(&out, "REPROMPT-REFUSED") >= 2,
+        "the re-prompt guard never spoke:\n{}",
+        out
+    );
+}
+
+#[test]
+fn a_script_can_tell_a_live_session_from_a_dead_one() {
+    // Without this, #all shouts at sessions that are down: during a server
+    // restart a crew's hunt ticker produced one refusal per command per
+    // session, which buried the reconnect messages.
+    let (port, _h) = spawn_status_prompt_mud(0);
+    let script = format!(
+        "#session live 127.0.0.1:{port}\n\
+         #session dead 127.0.0.1:1\n\
+         #delay {{1.0}} {{#all {{#showme STATE-$session-$connected}}}}\n\
+         #delay {{1.6}} {{#end}}\n"
+    );
+    let out = run_judytin_with(&["--dumb", "--offline"], &script, &[]);
+    assert!(out.contains("STATE-live-1"), "a connected session read as down:\n{}", out);
+    assert!(out.contains("STATE-dead-0"), "a refused session read as up:\n{}", out);
+}
+
+#[test]
+fn a_failed_session_does_not_end_a_run_that_still_has_live_ones() {
+    // The focus is wherever the script last put it. A #session that could not
+    // connect must not take the connected ones down with it at stdin EOF —
+    // during a server restart a failed #session is the normal case, and a
+    // crew script would lose the whole run to it.
+    // Generous margins on purpose: this failed once in a full parallel run
+    // and never on its own, which is the signature of a test measuring load
+    // rather than behaviour.
+    let (port, _h) = spawn_status_prompt_mud(0);
+    let script = format!(
+        "#session live 127.0.0.1:{port}\n\
+         #session dead 127.0.0.1:1\n\
+         #delay {{1.5}} {{#showme STILL-ALIVE}}\n\
+         #delay {{3.0}} {{#end}}\n"
+    );
+    let out = run_judytin_with(&["--dumb", "--offline"], &script, &[]);
+    assert!(
+        out.contains("input ended, still connected"),
+        "quit at EOF with a live session:\n{}",
+        out
+    );
+    assert_eq!(fires(&out, "STILL-ALIVE"), 1, "delays never ran:\n{}", out);
+}
+
+#[test]
+fn a_server_that_accepts_and_hangs_up_is_backed_away_from() {
+    // judymud defends itself — "That is enough for now. The door is shut" —
+    // and judytin used to keep knocking once a second regardless, because the
+    // backoff was credited on connecting rather than on the connection
+    // lasting. Forty refusals in one three-minute run, all judytin's fault.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(Mutex::new(0u32));
+    let h2 = hits.clone();
+    std::thread::spawn(move || {
+        while let Ok((mut sock, _)) = listener.accept() {
+            *h2.lock().unwrap() += 1;
+            let _ = sock.write_all(b"That is enough for now. The door is shut.\r\n");
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    let out = run_judytin_with(
+        &["--dumb", "--offline"],
+        &format!(
+            "#config {{reconnect}} {{on}}\n\
+             #session {{mud}} {{127.0.0.1:{port}}}\n\
+             #delay {{8.0}} {{#end}}\n"
+        ),
+        &[],
+    );
+    // The escalation must actually engage. Before the fix every wait was 1s.
+    assert!(out.contains("reconnecting in 1s"), "no first retry:\n{}", out);
+    assert!(out.contains("reconnecting in 2s"), "backoff never grew:\n{}", out);
+    assert!(out.contains("reconnecting in 4s"), "backoff stalled at 2s:\n{}", out);
+    // Eight seconds of 1s knocking would be ~8 hits; escalating gives ~4.
+    let n = *hits.lock().unwrap();
+    assert!(n <= 5, "knocked {} times in 8s — still hammering:\n{}", n, out);
+}
+
+#[test]
+fn a_prompt_already_shown_is_not_glued_onto_the_next_line() {
+    // judymud parks "30/30hp 12/12m 0g> " and sends the next message behind
+    // it. judytin shows the prompt (the packet patch has decided it is one)
+    // and then matches the completed line as prompt-plus-message, so every
+    // capture anchored at the start of a line silently swallows the prompt.
+    //
+    // Found the hard way: a bot grouping {%1 starts following you} sent
+    // "group 30/30hp 12/12m 0g> Magcoyb" and judymud answered "They are not
+    // here." for three minutes.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        let _ = sock.write_all(b"You are in a room.\r\n30/30hp 12/12m 0g> ");
+        // Well past the 30ms packet patch: judytin has shown this as a prompt.
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = sock.write_all(b"Magcoyb starts following you.\r\n");
+        std::thread::sleep(Duration::from_millis(700));
+    });
+    let script = "#action {%1 starts following you} {#showme GOT[%1]}\n#delay {2.4} {#end}\n";
+    let out = run_judytin(port, script);
+    assert!(
+        out.contains("GOT[Magcoyb]"),
+        "the prompt was glued to the front of the capture:\n{}",
+        out
+    );
+}
+
+#[test]
+fn a_line_split_across_packets_is_still_matched_whole() {
+    // The other half of the prompt-gluing fix. Within the packet-patch window
+    // nothing has been shown, so two packets that are really one line must
+    // still match as one — otherwise fixing prompts would break every server
+    // that writes a long line in pieces.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        let _ = sock.write_all(b"Magcoyb star");
+        // Well inside the 30ms patch window: this is one line, not a prompt.
+        std::thread::sleep(Duration::from_millis(5));
+        let _ = sock.write_all(b"ts following you.\r\n");
+        std::thread::sleep(Duration::from_millis(700));
+    });
+    let script = "#action {%1 starts following you} {#showme GOT[%1]}\n#delay {2.0} {#end}\n";
+    let out = run_judytin(port, script);
+    assert!(
+        out.contains("GOT[Magcoyb]"),
+        "a split line was not rejoined for matching:\n{}",
+        out
+    );
+}
+
+#[test]
+fn a_call_to_a_function_that_is_not_there_says_so_once() {
+    // Silence here is expensive: `#if {@playing{} == 1}` compares the string
+    // "@playing{}" to "1", is false forever, and the branch never runs. A
+    // rewrite that dropped one #function definition cost two full runs
+    // against a live server with nothing in the transcript to point at.
+    //
+    // Once per name, because a missing function inside a six-second ticker
+    // across four sessions would otherwise print forty times a minute.
+    let script = "\
+#function {real} {#return {7}}\n\
+#showme A=[@real{}] B=[@nope{}]\n\
+#showme C=[@nope{}] D=[@nope{}]\n\
+#end\n";
+    let out = run_judytin_with(&["--dumb", "--offline"], script, &[]);
+    assert!(out.contains("A=[7]"), "a real function stopped working:\n{}", out);
+    assert_eq!(
+        fires(&out, "no function {nope}"),
+        1,
+        "expected exactly one complaint per name:\n{}",
+        out
+    );
+    // Behaviour is otherwise unchanged: the text is still passed through.
+    assert!(out.contains("B=[@nope{}]"), "passthrough changed:\n{}", out);
+}
+
+/// A mock that speaks enough judymud for bots/core.tin to react to: a door,
+/// a login confirmation, the vitals line, and a refusal for a spell that is
+/// beyond a level-1 character.
+fn spawn_tiny_judymud() -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let h2 = heard.clone();
+    let handle = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(300)));
+        std::thread::sleep(Duration::from_millis(600));
+        let _ = sock.write_all(b"By what name do you wish to be known?\r\n");
+        let mut buf = [0u8; 512];
+        let mut line = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_millis(3500);
+        while std::time::Instant::now() < deadline {
+            let n = match sock.read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                Ok(n) => n,
+            };
+            for &b in &buf[..n] {
+                if b == b'\n' {
+                    let text = String::from_utf8_lossy(&line).trim().to_string();
+                    line.clear();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    h2.lock().unwrap().push(text.clone());
+                    if text.starts_with("guest") {
+                        let _ = sock.write_all(
+                            b"Welcome, bot. Type help for commands.\r\n\
+                              [27/27hp 19/19m 85/85v]\r\n",
+                        );
+                    } else if text.starts_with("cast") {
+                        let _ = sock.write_all(
+                            b"You are not yet learned enough for cause light (level 2).\r\n",
+                        );
+                    } else if text.starts_with("kill") {
+                        // Standing in a safe room: the crew must walk out of
+                        // it rather than swing at it for five minutes, which
+                        // is what a stranded cleric did for a whole run.
+                        let _ = sock.write_all(
+                            b"Something about this place refuses violence.\r\n",
+                        );
+                    }
+                } else if b != b'\r' {
+                    line.push(b);
+                }
+            }
+        }
+    });
+    (port, heard, handle)
+}
+
+#[test]
+fn the_shipped_bot_files_load_and_their_triggers_fire() {
+    // bots/ is a working bot and also a test of judytin. It only tests
+    // anything if it still runs: a rewrite once dropped one #function
+    // definition, every gate that called it silently became false, and the
+    // crew stood in a room full of things to kill sending nothing at all for
+    // two five-minute runs. That is the failure this guards.
+    let (port, heard, server) = spawn_tiny_judymud();
+    let script = format!(
+        "#read bots/core.tin\n\
+         #variable {{login[mud]}} {{guest bot cleric}}\n\
+         #session {{mud}} {{127.0.0.1:{port}}}\n\
+         #variable {{role[mud]}} {{cleric}}\n\
+         #variable {{atk[mud]}} {{cast 'cause light'}}\n\
+         #variable {{atkspell[mud]}} {{cause light}}\n\
+         #variable {{wimpy[mud]}} {{25}}\n\
+         #variable {{aimat[mud]}} {{0}}\n\
+         #delay {{2.0}} {{crewfight}}\n\
+         #delay {{3.0}} {{#showme GATE=@playing{{}} HP=$hp[mud] ATK=$atk[mud]}}\n\
+         #delay {{3.6}} {{#end}}\n"
+    );
+    let out = run_judytin_with(&["--dumb", "--offline"], &script, &[]);
+    let _ = server.join();
+    let said = heard.lock().unwrap().clone();
+
+    // Every @name{} in the files resolves. This is the cheap half and the
+    // half that would have saved ten minutes of live play.
+    assert!(
+        !out.contains("no function"),
+        "a bot file calls a function that is not defined:\n{}",
+        out
+    );
+    // The login trigger answered the door.
+    assert!(
+        said.iter().any(|l| l == "guest bot cleric"),
+        "the crew never logged in — heard {:?}\n{}",
+        said,
+        out
+    );
+    // The vitals line was parsed into per-session state, and being in the
+    // world was noticed, so the gate that guards every game command is open.
+    assert!(out.contains("GATE=1"), "@playing{{}} never opened:\n{}", out);
+    assert!(out.contains("HP=27"), "the vitals line was not parsed:\n{}", out);
+    // And the crew learned it cannot cast what it asked for, falling back to
+    // melee rather than repeating a spell it does not have.
+    assert!(
+        said.iter().any(|l| l.starts_with("cast")),
+        "never tried its spell — heard {:?}\n{}",
+        said,
+        out
+    );
+    assert!(out.contains("ATK=kill"), "did not fall back to melee:\n{}", out);
+    // Refused by a safe room, it walks its route out instead of standing
+    // there. A cleric that never did this kept 12 experience for four runs
+    // while the rest of the crew reached level 3.
+    assert!(
+        said.iter().any(|l| l == "recall"),
+        "stayed in the safe room after being refused — heard {:?}\n{}",
+        said,
+        out
+    );
+}
+
+#[test]
+fn a_variable_can_name_a_file_to_read() {
+    // One alias has to be able to load the right class file for a character,
+    // and the roster is generated, so the names cannot be written into the
+    // launcher. #system already substituted its argument; these did not.
+    let dir = std::env::temp_dir().join(format!("judytin-readvar-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("chosen.tin");
+    std::fs::write(&file, "#showme FROM-THE-FILE\n").unwrap();
+    let script = format!(
+        "#variable {{which}} {{chosen}}\n\
+         #read {}/$which.tin\n\
+         #end\n",
+        dir.display()
+    );
+    let out = run_judytin_with(&["--dumb", "--offline"], &script, &[]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.contains("FROM-THE-FILE"),
+        "a variable could not name a file to read:\n{}",
+        out
+    );
+}
+
+/// A judymud-shaped door that issues a resume key on first login, then dies
+/// once — a server restart under a crew that is mid-fight.
+fn spawn_restarting_door() -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let h2 = heard.clone();
+    let handle = std::thread::spawn(move || {
+        for round in 0..2 {
+            let Ok((mut sock, _)) = listener.accept() else { return };
+            let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = sock.write_all(b"By what name do you wish to be known?\r\n");
+            let mut buf = [0u8; 512];
+            let mut line = Vec::new();
+            let deadline = std::time::Instant::now() + Duration::from_millis(2200);
+            while std::time::Instant::now() < deadline {
+                let n = match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => continue,
+                    Ok(n) => n,
+                };
+                for &b in &buf[..n] {
+                    if b == b'\n' {
+                        let text = String::from_utf8_lossy(&line).trim().to_string();
+                        line.clear();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        h2.lock().unwrap().push(text.clone());
+                        if text.starts_with("guest") {
+                            // The name is free the first time and taken after.
+                            if round == 0 {
+                                let _ = sock.write_all(
+                                    b"Welcome, bot. Type help for commands.\r\n\
+                                      Your resume key is NotARealKey1 \xe2\x80\x94 keep it. \
+                                      `resume bot NotARealKey1` brings you back, and so \
+                                      does your name at the door.\r\n",
+                                );
+                            } else {
+                                let _ = sock.write_all(b"That name is already someone\'s.\r\n");
+                            }
+                        } else if text.starts_with("resume") {
+                            let _ = sock.write_all(b"Welcome back.\r\n");
+                        }
+                    } else if b != b'\r' {
+                        line.push(b);
+                    }
+                }
+            }
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    (port, heard, handle)
+}
+
+#[test]
+fn a_crew_comes_back_with_resume_after_a_restart_not_guest() {
+    // `guest` works exactly once. Before the bot learned to swap its own
+    // login, the first judymud restart locked the whole crew out: the stored
+    // login was re-sent, the name was taken, and four characters that had
+    // been mid-fight never got back in.
+    //
+    // Storing the key in a variable is allowed where writing it to a file is
+    // not, and that difference is the point: the key is server text, kept
+    // escaped, unescaped once when it is sent back at the door.
+    let (port, heard, server) = spawn_restarting_door();
+    let script = format!(
+        "#read bots/core.tin\n\
+         #config {{reconnect}} {{on}}\n\
+         #variable {{login[mud]}} {{guest bot cleric}}\n\
+         #variable {{wimpy[mud]}} {{25}}\n\
+         #variable {{isleader[mud]}} {{yes}}\n\
+         #session {{mud}} {{127.0.0.1:{port}}}\n\
+         #delay {{6.0}} {{#end}}\n"
+    );
+    let out = run_judytin_with(&["--dumb", "--offline"], &script, &[]);
+    let _ = server.join();
+    let said = heard.lock().unwrap().clone();
+    assert!(
+        said.iter().any(|l| l == "guest bot cleric"),
+        "never logged in the first time — heard {:?}\n{}",
+        said,
+        out
+    );
+    assert!(
+        said.iter().any(|l| l == "resume bot NotARealKey1"),
+        "came back with the wrong login after the restart — heard {:?}\n{}",
+        said,
+        out
+    );
+    // And exactly once with guest: a second guest is the lock-out.
+    assert_eq!(
+        said.iter().filter(|l| l.starts_with("guest")).count(),
+        1,
+        "sent guest again after the name was taken — heard {:?}\n{}",
+        said,
+        out
+    );
+}
+
+#[test]
+fn a_burst_the_player_asked_for_is_not_throttled() {
+    // The trigger-loop ceiling counts only server-caused sends. A script the
+    // player runs may be as busy as it likes: 150 lines at once is a mapper
+    // walking a path, not a conversation answering itself.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(0u32));
+    let s2 = seen.clone();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(100)));
+        std::thread::sleep(Duration::from_millis(500));
+        let _ = sock.write_all(b"ready\r\n");
+        let mut buf = [0u8; 8192];
+        let deadline = std::time::Instant::now() + Duration::from_millis(2500);
+        while std::time::Instant::now() < deadline {
+            match sock.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => *s2.lock().unwrap() += buf[..n].iter().filter(|&&b| b == b'\n').count() as u32,
+                Err(_) => continue,
+            }
+        }
+    });
+    let out = run_judytin(port, "#delay {1.0} {#150 {look}}\n#delay {2.2} {#end}\n");
+    let n = *seen.lock().unwrap();
+    assert_eq!(n, 150, "a player-driven burst was throttled: server saw {}\n{}", n, out);
+    assert!(
+        !out.contains("lines in a second"),
+        "the trigger ceiling fired on the player's own script:\n{}",
+        out
+    );
+}
+
+#[test]
+fn a_declared_prompt_is_stripped_even_when_it_shares_a_packet() {
+    // judytin-w9e. The packet-patch boundary cannot help when a server writes
+    // its prompt and the next message in one write: nothing separates them.
+    // A #prompt pattern is the script saying what its prompt looks like, and
+    // taking it at its word costs no heuristics.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        // Prompt and message in a single write, exactly as judymud does it.
+        let _ = sock.write_all(b"30/30hp 12/12m 0g> Magcoyb starts following you.\r\n");
+        std::thread::sleep(Duration::from_millis(800));
+    });
+    let script = "\
+#prompt {%1/%2hp %3/%4m %5g>} {#nop just declaring the shape}\n\
+#action {%1 starts following you} {#showme GOT[%1]}\n\
+#delay {2.0} {#end}\n";
+    let out = run_judytin(port, script);
+    assert!(
+        out.contains("GOT[Magcoyb]"),
+        "a declared prompt was still glued to the capture:\n{}",
+        out
+    );
+}
+
+#[test]
+fn without_a_declared_prompt_nothing_is_stripped() {
+    // The fix must not guess. With no #prompt registered, a line is whatever
+    // the server sent, exactly as before.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        let _ = sock.write_all(b"30/30hp 12/12m 0g> Magcoyb starts following you.\r\n");
+        std::thread::sleep(Duration::from_millis(800));
+    });
+    let script = "#action {%1 starts following you} {#showme GOT[%1]}\n#delay {2.0} {#end}\n";
+    let out = run_judytin(port, script);
+    assert!(
+        out.contains("GOT[30/30hp 12/12m 0g> Magcoyb]"),
+        "something was stripped without being asked:\n{}",
+        out
+    );
+}
+
+#[test]
+fn a_line_that_is_only_a_prompt_still_reaches_actions() {
+    // Stripping a prompt that is the whole line would leave nothing, which
+    // silences triggers rather than aiming them.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        let _ = sock.write_all(b"30/30hp 12/12m 0g>\r\n");
+        std::thread::sleep(Duration::from_millis(800));
+    });
+    let script = "\
+#prompt {%1/%2hp %3/%4m %5g>} {#nop shape}\n\
+#action {%1/%2hp %3/%4m %5g>} {#showme WHOLE[%1]}\n\
+#delay {2.0} {#end}\n";
+    let out = run_judytin(port, script);
+    assert!(out.contains("WHOLE[30]"), "a prompt-only line was emptied:\n{}", out);
+}
+
+#[test]
+fn a_piped_login_script_catches_the_door() {
+    // judytin-iz5. Startup used to open the socket and only afterwards begin
+    // reading stdin, so the greeting had a head start on the trigger written
+    // to catch it: the #action registered after the door prompt had already
+    // been processed and never fired, leaving the character at the prompt
+    // while the rest of the script ran into the void.
+    //
+    // The mock answers immediately, which is the losing case — a local
+    // server has the greeting on the wire before a piped script is read.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let h2 = heard.clone();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(1200)));
+        // No pause at all: greet the instant the socket opens.
+        let _ = sock.write_all(b"By what name do you wish to be known?\r\n");
+        let mut buf = [0u8; 512];
+        let mut line = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        while std::time::Instant::now() < deadline {
+            let n = match sock.read(&mut buf) {
+                Ok(0) | Err(_) => continue,
+                Ok(n) => n,
+            };
+            for &b in &buf[..n] {
+                if b == b'\n' {
+                    let t = String::from_utf8_lossy(&line).trim().to_string();
+                    line.clear();
+                    if !t.is_empty() {
+                        h2.lock().unwrap().push(t);
+                    }
+                } else if b != b'\r' {
+                    line.push(b);
+                }
+            }
+        }
+    });
+    let out = run_judytin(
+        port,
+        "#action {By what name do you wish to be known} {guest bob warrior}\n\
+         #delay {1.6} {#end}\n",
+    );
+    let said = heard.lock().unwrap().clone();
+    assert!(
+        said.iter().any(|l| l == "guest bob warrior"),
+        "the login trigger missed the door — heard {:?}\n{}",
+        said,
+        out
+    );
+}
+
+#[test]
+fn a_piped_command_before_the_connection_still_arrives() {
+    // The other half: reading the script first must not make a script whose
+    // first line is an ordinary command fail with "not connected". It waits
+    // for the socket instead of being refused by it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let h2 = heard.clone();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(1200)));
+        let _ = sock.write_all(b"Welcome.\r\n");
+        let mut buf = [0u8; 512];
+        let mut line = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        while std::time::Instant::now() < deadline {
+            let n = match sock.read(&mut buf) {
+                Ok(0) | Err(_) => continue,
+                Ok(n) => n,
+            };
+            for &b in &buf[..n] {
+                if b == b'\n' {
+                    let t = String::from_utf8_lossy(&line).trim().to_string();
+                    line.clear();
+                    if !t.is_empty() {
+                        h2.lock().unwrap().push(t);
+                    }
+                } else if b != b'\r' {
+                    line.push(b);
+                }
+            }
+        }
+    });
+    let out = run_judytin(port, "look\n#delay {1.6} {#end}\n");
+    let said = heard.lock().unwrap().clone();
+    assert!(
+        said.iter().any(|l| l == "look"),
+        "a command sent before the socket was open got lost — heard {:?}\n{}",
+        said,
+        out
+    );
+    assert!(
+        !out.contains("not connected"),
+        "the script was refused instead of queued:\n{}",
+        out
+    );
+}
+
+#[test]
+fn a_list_can_be_walked_the_way_tt_plus_plus_writes_it() {
+    // judytin-c04. $name[%*] is every item at once, which is how tt++ spells
+    // an iteration. Without it the subscript was taken literally, #foreach
+    // received the string "$prey[%*]" and looped once over that — a single
+    // bogus iteration that looks like it ran, which is the worst outcome.
+    let script = "\
+#list {prey} {create} {believer}{apprentice}{pilferer}\n\
+#showme ALL=[$prey[%*]]\n\
+#foreach {$prey[%*]} {t} {#showme HIT=[$t]}\n\
+#showme GONE=[$nosuchlist[%*]]\n\
+#end\n";
+    let out = run_judytin_with(&["--dumb", "--offline"], script, &[]);
+    assert!(out.contains("ALL=[believer;apprentice;pilferer]"), "no %* expansion:\n{}", out);
+    assert_eq!(fires(&out, "HIT="), 3, "#foreach did not walk the list:\n{}", out);
+    assert!(out.contains("HIT=[pilferer]"), "last item missing:\n{}", out);
+    // A list that does not exist is empty, not its own name.
+    assert!(out.contains("GONE=[]"), "an absent list expanded to itself:\n{}", out);
 }

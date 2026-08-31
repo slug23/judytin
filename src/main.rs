@@ -162,16 +162,6 @@ fn main() {
         app.cmd_read(script, 0);
     }
 
-    if !args.offline {
-        if let Some(dest) = &args.ssh {
-            app.connect_ssh(dest);
-        } else if args.tls {
-            app.connect_tls(&args.host, args.port.unwrap_or(2324));
-        } else {
-            app.connect(&args.host, args.port.unwrap_or(DEFAULT_PORT));
-        }
-    }
-
     // input thread
     if dumb {
         let tx = tx.clone();
@@ -209,6 +199,41 @@ fn main() {
         });
     }
 
+    // Now connect — after the input thread exists, and after whatever the
+    // pipe already had to say has been read.
+    //
+    // The old order opened the socket first and only then started reading
+    // stdin, which gave the server's greeting a head start on the triggers
+    // written to catch it. A login #action could register after the door
+    // prompt had already been processed, and the character then sat at "By
+    // what name do you wish to be known?" while the rest of the script ran
+    // into the void. It worked often enough to look fine (judytin-iz5).
+    if !args.offline {
+        let (ssh, tls, host, port) = (args.ssh.clone(), args.tls, args.host.clone(), args.port);
+        // Anything the script sends in the meantime waits for the socket
+        // rather than being refused by it.
+        app.hold_until_connected();
+        if dumb {
+            drain_ready_input(&mut app, &rx, &tx);
+        }
+        // In the session that was there first: the script may have opened
+        // its own and left the focus on one of them.
+        app.on_pending_session(|a| {
+            if let Some(dest) = &ssh {
+                a.connect_ssh(dest);
+            } else if tls {
+                a.connect_tls(&host, port.unwrap_or(2324));
+            } else {
+                a.connect(&host, port.unwrap_or(DEFAULT_PORT));
+            }
+            // Nothing to wait for after all: drop what was queued rather than
+            // sending it to whatever gets opened next.
+            if !a.is_connected() {
+                a.drop_held();
+            }
+        });
+    }
+
     // main event loop
     while !app.quit {
         let timeout = app
@@ -221,6 +246,40 @@ fn main() {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
         app.tick();
+    }
+}
+
+/// Run whatever the pipe already has, before the connection is opened.
+///
+/// Bounded twice: it stops as soon as stdin goes quiet for a moment, and in
+/// any case after a short ceiling, so a script still being produced upstream
+/// cannot hold the connection open indefinitely.
+///
+/// End-of-input is put back rather than acted on. Handling it here would find
+/// no connection yet, decide there was nothing left to wait for, and quit
+/// before the socket had been opened at all.
+fn drain_ready_input(app: &mut App, rx: &mpsc::Receiver<Ev>, tx: &mpsc::Sender<Ev>) {
+    // The first line is worth waiting for: at this point the process has
+    // barely started and whoever is feeding the pipe may not have been
+    // scheduled yet. Between lines a much shorter pause is enough, since a
+    // script arrives in one go.
+    const FIRST: Duration = Duration::from_millis(250);
+    const QUIET: Duration = Duration::from_millis(40);
+    const CEILING: Duration = Duration::from_millis(600);
+    let deadline = Instant::now() + CEILING;
+    let mut wait = FIRST;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(wait) {
+            Ok(Ev::StdinEof) => {
+                let _ = tx.send(Ev::StdinEof);
+                return;
+            }
+            Ok(ev) => {
+                app.on_event(ev);
+                wait = QUIET;
+            }
+            Err(_) => return,
+        }
     }
 }
 

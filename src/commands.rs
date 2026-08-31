@@ -15,10 +15,10 @@ const COMMANDS: &[&str] = &[
     "continue", "cr", "default", "delay", "echo", "else", "elseif", "end", "event",
     "foreach", "format", "function", "gag", "grep", "help", "highlight", "history", "if",
     "info", "kill", "line", "local", "log", "loop", "macro", "math", "message", "nop",
-    "list", "path", "pathdir", "read", "reconnect", "return", "run", "send", "session",
+    "list", "path", "pathdir", "prompt", "read", "reconnect", "return", "run", "send", "session",
     "showme", "split",
     "ssl", "substitute", "switch", "system", "tab", "textin", "ticker", "unaction", "unalias",
-    "undelay", "unevent", "unfunction", "ungag", "unhighlight", "unmacro",
+    "undelay", "unevent", "unfunction", "ungag", "unhighlight", "unmacro", "unprompt",
     "unsubstitute", "untab", "unticker", "unvariable", "variable", "while", "write",
     "zap",
 ];
@@ -50,6 +50,26 @@ impl App {
             *chain = None;
             return self.cmd_repeat(&name, rest, depth);
         }
+        // `#$leader look` — the word after # may name a session through a
+        // variable. Expanded here and offered to session lookup *only*:
+        // variables can hold server text, and this client's first rule is
+        // that server text never becomes a command, so an expansion is
+        // allowed to choose who runs something and never what runs.
+        let raw = if raw.contains('$') || raw.contains('@') {
+            let expanded = self.subst(&raw, depth);
+            if self.session_index(&expanded).is_some() {
+                expanded
+            } else {
+                self.info(&format!(
+                    "no session named '{}' — #session lists them",
+                    expanded
+                ));
+                *chain = None;
+                return Flow::Ok;
+            }
+        } else {
+            raw
+        };
         let resolved = if COMMANDS.contains(&name.as_str()) {
             name.clone()
         } else if let Some(i) = self.session_index(&raw) {
@@ -148,13 +168,22 @@ impl App {
             // ---- triggers -----------------------------------------------
             "alias" => self.cmd_define("alias", rest),
             "unalias" => self.cmd_undefine("alias", rest),
-            "action" => self.cmd_action(rest),
+            "action" => self.cmd_action(rest, false),
+            "prompt" => self.cmd_action(rest, true),
             "unaction" => {
                 let key = get_tail(rest);
                 if self.actions.remove(&key).is_some() {
                     self.info_kind("action", &format!("ok. action {{{}}} removed", key));
                 } else {
                     self.info_kind("action", &format!("no action {{{}}}", key));
+                }
+            }
+            "unprompt" => {
+                let key = get_tail(rest);
+                if self.prompts.remove(&key).is_some() {
+                    self.info_kind("prompt", &format!("ok. prompt {{{}}} removed", key));
+                } else {
+                    self.info_kind("prompt", &format!("no prompt {{{}}}", key));
                 }
             }
             "substitute" => self.cmd_define("substitute", rest),
@@ -244,7 +273,7 @@ impl App {
             "info" => self.cmd_info(),
             "message" => self.cmd_message(rest),
             "line" => return self.cmd_line(rest, depth),
-            "log" => self.cmd_log(rest),
+            "log" => self.cmd_log(rest, depth),
             // ---- buffer & history ---------------------------------------
             "buffer" => self.cmd_buffer(rest),
             "grep" => self.cmd_grep(rest),
@@ -255,8 +284,8 @@ impl App {
             // ---- misc ---------------------------------------------------
             "config" => self.cmd_config(rest),
             "read" => self.cmd_read(rest, depth),
-            "write" => self.cmd_write(rest),
-            "textin" => self.cmd_textin(rest),
+            "write" => self.cmd_write(rest, depth),
+            "textin" => self.cmd_textin(rest, depth),
             "system" => self.cmd_system(rest, depth),
             _ => unreachable!(),
         }
@@ -650,10 +679,22 @@ impl App {
     fn cmd_variable(&mut self, rest: &str, depth: u32) {
         let (key, r2) = get_arg(rest);
         let val = get_tail(r2);
-        if key.is_empty() || val.is_empty() {
+        // `#variable {x}` asks what x is; `#variable {x} {}` sets it to
+        // nothing. Both leave val empty, so the braces are what tells them
+        // apart — and an empty value is worth being able to set, because for
+        // a script "this character has no healing spell" is a fact, not the
+        // absence of one.
+        let explicit = r2.trim_start().starts_with('{');
+        if key.is_empty() || (val.is_empty() && !explicit) {
             self.cmd_define("variable", rest);
             return;
         }
+        // The name is substituted for the same reason #list substitutes its
+        // list name: $hp[$session] has to reach hp[warrior] on the way in as
+        // well as on the way out. Without this a keyed write lands on a
+        // variable literally called `hp[$session]` and every session shares
+        // it, which is the exact opposite of what $session is for.
+        let key = self.subst(&key, depth);
         // variables store their substituted value (tt++ copies content)
         let val = self.subst(&val, depth);
         self.vars.insert(key.clone(), val.clone());
@@ -812,31 +853,34 @@ impl App {
         ));
     }
 
-    fn cmd_action(&mut self, rest: &str) {
+    /// `#action` and `#prompt` are the same command over two tables: one
+    /// matched against completed lines, one against the prompt.
+    fn cmd_action(&mut self, rest: &str, prompt: bool) {
+        let kind = if prompt { "prompt" } else { "action" };
         let (pat, r2) = get_arg(rest);
         let body = get_tail(r2);
+        fn table(a: &mut App, prompt: bool) -> &mut BTreeMap<String, Trigger> {
+            if prompt { &mut a.prompts } else { &mut a.actions }
+        }
         if pat.is_empty() {
-            let snapshot: BTreeMap<String, String> = self
-                .actions
+            let snapshot: BTreeMap<String, String> = table(self, prompt)
                 .iter()
                 .map(|(k, t)| (k.clone(), t.body.clone()))
                 .collect();
-            self.cmd_list("action", &snapshot);
+            self.cmd_list(kind, &snapshot);
         } else if body.is_empty() {
-            match self.actions.get(&pat) {
+            match table(self, prompt).get(&pat) {
                 Some(t) => {
                     let b = t.body.clone();
-                    self.info(&format!("#action {{{}}} {{{}}}", pat, b));
+                    self.info(&format!("#{} {{{}}} {{{}}}", kind, pat, b));
                 }
-                None => self.info(&format!("no action {{{}}}", pat)),
+                None => self.info(&format!("no {} {{{}}}", kind, pat)),
             }
         } else {
-            self.actions.insert(
-                pat.clone(),
-                Trigger { body: body.clone(), shots: self.shots_mode },
-            );
-            self.tag_class("action", &pat);
-            self.info_kind("action", &format!("ok. action {{{}}} = {{{}}}", pat, body));
+            let shots = self.shots_mode;
+            table(self, prompt).insert(pat.clone(), Trigger { body: body.clone(), shots });
+            self.tag_class(kind, &pat);
+            self.info_kind(kind, &format!("ok. {} {{{}}} = {{{}}}", kind, pat, body));
         }
     }
 
@@ -1161,6 +1205,7 @@ impl App {
         match kind {
             "alias" => self.aliases.get(key).map(|v| format!("#alias {{{}}} {{{}}}", key, v)),
             "action" => self.actions.get(key).map(|t| format!("#action {{{}}} {{{}}}", key, t.body)),
+            "prompt" => self.prompts.get(key).map(|t| format!("#prompt {{{}}} {{{}}}", key, t.body)),
             "substitute" => self.subs.get(key).map(|v| format!("#substitute {{{}}} {{{}}}", key, v)),
             "variable" => self.vars.get(key).map(|v| format!("#variable {{{}}} {{{}}}", key, v)),
             "function" => self.functions.get(key).map(|v| format!("#function {{{}}} {{{}}}", key, v)),
@@ -1180,6 +1225,7 @@ impl App {
         match kind {
             "alias" => self.aliases.remove(key).is_some(),
             "action" => self.actions.remove(key).is_some(),
+            "prompt" => self.prompts.remove(key).is_some(),
             "substitute" => self.subs.remove(key).is_some(),
             "variable" => self.vars.remove(key).is_some(),
             "function" => self.functions.remove(key).is_some(),
@@ -1318,12 +1364,12 @@ impl App {
         Flow::Ok
     }
 
-    fn cmd_log(&mut self, rest: &str) {
+    fn cmd_log(&mut self, rest: &str, depth: u32) {
         if !self.guard_local_effects("#log") {
             return;
         }
         let (op, r2) = get_arg(rest);
-        let file = crate::data::unescape(&get_tail(r2));
+        let file = crate::data::unescape(&self.subst(&get_tail(r2), depth));
         match op.to_lowercase().as_str() {
             "append" | "overwrite" => {
                 if file.is_empty() {
@@ -1990,7 +2036,11 @@ impl App {
         if !self.guard_local_effects("#read") {
             return;
         }
-        let path = crate::data::unescape(&get_tail(rest));
+        // Substituted like #system's argument and #list's name: a variable
+        // has to be able to name a file, or one alias cannot load the right
+        // class file for a character. Safe on the same footing as #system —
+        // the guard above means no trigger, event or timer ever gets here.
+        let path = crate::data::unescape(&self.subst(&get_tail(rest), depth));
         if path.is_empty() {
             self.info("usage: #read {file}");
             return;
@@ -2012,11 +2062,11 @@ impl App {
         }
     }
 
-    fn cmd_write(&mut self, rest: &str) {
+    fn cmd_write(&mut self, rest: &str, depth: u32) {
         if !self.guard_local_effects("#write") {
             return;
         }
-        let path = crate::data::unescape(&get_tail(rest));
+        let path = crate::data::unescape(&self.subst(&get_tail(rest), depth));
         if path.is_empty() {
             self.info("usage: #write {file}");
             return;
@@ -2078,11 +2128,11 @@ impl App {
         }
     }
 
-    fn cmd_textin(&mut self, rest: &str) {
+    fn cmd_textin(&mut self, rest: &str, depth: u32) {
         if !self.guard_local_effects("#textin") {
             return;
         }
-        let path = crate::data::unescape(&get_tail(rest));
+        let path = crate::data::unescape(&self.subst(&get_tail(rest), depth));
         if path.is_empty() {
             self.info("usage: #textin {file}");
             return;
@@ -2135,16 +2185,19 @@ impl App {
 \r
   \x1b[1mlists\x1b[0m     #list {name} {create|add|clear|get|set|size|find} {args}\r
             #list {name} {insert|delete|sort|reverse|explode|collapse}\r
-            items live in $name[1]..; $name[-1] is the last\r
+            items live in $name[1]..; $name[-1] is the last, $name[%*] is all\r
   \x1b[1msession\x1b[0m   #session {name} {where} opens — {where} is host, host:port,\r
             ssl://host or ssh://you@host (each door has its own default)\r
             #session lists them, #session {name} switches, #zap {name} closes\r
             #name {command} runs it there, #all {command} runs it everywhere\r
-            $session is the name of the session a command is running in\r
+            $session names the session a command is running in, and\r
+            $connected is 1 there if it holds a connection, else 0\r
             #reconnect  return to the last session, whatever the transport\r
             #config {reconnect} {on}  keep retrying after a server-side drop\r
             #ssl {name} {host} {port} and #run {name} {cmd} — tt++'s spellings\r
   \x1b[1mtriggers\x1b[0m  #alias #action #highlight #substitute #gag #variable #function\r
+            #prompt {%1/%2hp} {...} matches the prompt, which #action cannot\r
+            #$var {command} runs it in the session $var names\r
             #macro {f5} {...}  #event {SESSION CONNECTED} {...}  #tab {word}\r
             each has an #un... remover; bare command lists definitions\r
   \x1b[1mflow\x1b[0m      #if {expr} {then} {else}, #elseif, #else, #switch/#case/#default\r

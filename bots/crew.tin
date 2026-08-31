@@ -1,0 +1,95 @@
+#nop ── crew.tin ── four characters, four classes, one judytin ───────────
+#nop
+#nop   judytin -r bots/crew.tin --offline
+#nop
+#nop --offline because this file opens its own sessions. Starting with a
+#nop connection on the command line instead would race the door: the script
+#nop and the socket are separate channels and nothing orders them, so a
+#nop login #action can register after the prompt it was written for has
+#nop already gone by (judytin-iz5). Opening from inside the script means
+#nop every trigger is in place before a socket exists.
+
+#nop Everything the crew defines goes into one class, so the whole bot can
+#nop be listed with #class {crew} {list} or taken out in one move with
+#nop #class {crew} {kill} — useful when you want the client back to play in
+#nop by hand without restarting it.
+#class {crew} {open}
+
+#read bots/core.tin
+
+#nop ── who ──────────────────────────────────────────────────────────────
+#nop crew.local.tin supplies the roster and the logins. It is not in the
+#nop repository and must not be: a judymud resume key *is* the character,
+#nop and this repository is public. *.local.tin is git-ignored.
+#nop
+#nop It should set, for each member:
+#nop   #variable {login[<name>]} {guest <name> <class>}     first time
+#nop   #variable {login[<name>]} {resume <name> <key>}      afterwards
+#nop and list the members in order:
+#nop   #list {roster} {create} {<war>}{<cle>}{<mag>}{<thi>}
+#nop   #variable {class[<name>]} {warrior}   ...and so on
+#read bots/crew.local.tin
+
+#variable {mud} {127.0.0.1:2323}
+
+#nop ── open one session per character ──────────────────────────────────
+#nop Each #session moves the focus, so the #read straight after it binds
+#nop that class file to that character and no other. The pair has to stay
+#nop together. That is the whole mechanism.
+#nop
+#nop #foreach cannot do this — it would need to interpolate a file name from
+#nop the class — so the roster is walked by index instead.
+#nop $aimat is this character's place in the prey list. It must exist before
+#nop @aim{} does arithmetic on it: an undefined variable in judytin (and in
+#nop tt++) expands to its own literal text, not to nothing, so "$aimat[bob]"
+#nop would reach #math as the word $aimat[bob] and the expression would fail
+#nop rather than default to zero.
+#alias {enlist} {#session %1 $mud;#read bots/%2.tin;#variable {aimat[%1]} {0}}
+
+#nop Keep trying after a server-side drop. judymud is under development and
+#nop restarts. SESSION CONNECTED in core.tin re-sends the login, so a restart
+#nop costs the crew a few seconds rather than the run.
+#config {reconnect} {on}
+
+#nop ── the run ──────────────────────────────────────────────────────────
+#alias {settle} {#all {#if {@playing{} == 1} {wimpy $wimpy[$session]}};#all {#if {@playing{} == 1 && "$buffspell[$session]" != ""} {cast '$buffspell[$session]'}}}
+
+#nop $leader is the roster's first member, the warrior. Everyone else
+#nop follows it, so one #north moves four characters and the crew stays in
+#nop one room. Grouping is what splits a kill's experience across all four,
+#nop which is the only reason a level-1 mage gains anything at all.
+#variable {leader} {$roster[1]}
+#alias {assemble} {#all {#if {@playing{} == 1 && "$isleader[$session]" == ""} {follow $leader}};#$leader {group $roster[2];group $roster[3];group $roster[4]}}
+
+#nop ── one word to start ──────────────────────────────────────────────
+#nop Everything else in this file is a piece you can drive by hand. This is
+#nop the whole thing: log four characters in, each bound to its class file.
+#nop $class[$roster[1]] resolves inside out, so the roster stays the only
+#nop place the names and classes are written down.
+#alias {crewgo} {enlist $roster[1] $class[$roster[1]];enlist $roster[2] $class[$roster[2]];enlist $roster[3] $class[$roster[3]];enlist $roster[4] $class[$roster[4]]}
+
+#nop Grouping and buffing happen on arrival, in core.tin, so there is
+#nop nothing to run between crewgo and hunting. Walking to the training
+#nop ground is the one thing left, because only the leader needs to do it.
+#alias {crewhunt} {#$leader {@gotohunt{}};#delay {6} {huntstart};#delay {6} {watchstart};#delay {8} {rallystart}}
+
+#alias {huntstart} {#ticker {hunt} {crewfight} {6}}
+#alias {huntstop}  {#unticker {hunt}}
+
+#nop A follower that arrived before the leader was told "They are not here."
+#nop and never tried again — the cleric spent a whole run ungrouped and kept
+#nop every scrap of its own experience instead of sharing four ways. Retrying
+#nop slowly costs three commands a minute and heals that, and every other way
+#nop of ending up adrift as well: dying, being teleported, arriving during a
+#nop restart.
+#alias {rallystart} {#ticker {rally} {@rally{}} {45}}
+#alias {rallystop}  {#unticker {rally}}
+
+#nop A crew that is winning still needs watching, so say something every
+#nop half minute rather than only at the end.
+#alias {watchstart} {#ticker {watch} {crewvitals} {30}}
+#alias {watchstop}  {#unticker {watch}}
+
+#alias {crewoff} {#class {crew} {kill};#showme {judytin: crew unloaded}}
+
+#class {crew} {close}

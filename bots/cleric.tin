@@ -1,0 +1,18 @@
+#nop ── cleric.tin ── read while the cleric's session is current ────────
+#nop
+#nop The cleric is why the crew survives a bad room. @panic{} in core.tin
+#nop fires on the vitals line, which judymud sends every round, and casts
+#nop $heal[$session] — so the cleric is the only character that has one.
+#nop
+#nop At level 1 a cleric has `cure light` and nothing else worth casting:
+#nop `cause light` is level 2 and `armor` is level 3. Both are named here
+#nop anyway. core.tin reaches for them, is told "not yet learned enough",
+#nop falls back to melee, and reaches again at every level gained.
+
+#variable {role[$session]}      {cleric}
+#variable {atk[$session]}       {cast 'cause light'}
+#variable {atkspell[$session]}  {cause light}
+#variable {heal[$session]}      {cure light}
+#variable {buffspell[$session]} {armor}
+#variable {wimpy[$session]}     {25}
+#variable {isleader[$session]}    {}

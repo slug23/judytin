@@ -1,0 +1,17 @@
+#nop ── mage.tin ── read while the mage's session is current ───────────
+#nop
+#nop A level-1 mage cannot finish a fight: it hits for two to five against
+#nop training mobs that take twenty, and the mob wanders off or kills it
+#nop first. Grouped behind a warrior it takes a share of every kill instead
+#nop of all of nothing, which is the whole reason the crew exists rather
+#nop than four characters grinding separately.
+#nop
+#nop Unlike the cleric, a mage has both its attack and its armor at level 1.
+
+#variable {role[$session]}      {mage}
+#variable {atk[$session]}       {cast 'magic missile'}
+#variable {atkspell[$session]}  {magic missile}
+#variable {heal[$session]}      {}
+#variable {buffspell[$session]} {armor}
+#variable {wimpy[$session]}     {30}
+#variable {isleader[$session]}    {}

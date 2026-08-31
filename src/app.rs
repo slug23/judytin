@@ -167,6 +167,13 @@ pub(crate) struct Session {
     /// Unique across every session ever opened, so a late packet from a
     /// connection that has already gone cannot be mistaken for a live one.
     pub(crate) conn_id: u64,
+    /// When the current connection came up. A connection that dies almost
+    /// immediately must not be credited as a successful one.
+    pub(crate) up_since: Option<Instant>,
+    /// A connection is being opened for this session but has not arrived yet.
+    /// Marks the blank startup session as spoken for, so a `#session` in the
+    /// script judytin reads first cannot quietly take it over.
+    pub(crate) pending_connect: bool,
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) telnet: Telnet,
@@ -187,6 +194,8 @@ impl Session {
             name: name.to_string(),
             conn: None,
             conn_id: 0,
+            up_since: None,
+            pending_connect: false,
             host: String::new(),
             port: 0,
             telnet: Telnet::new(),
@@ -244,6 +253,21 @@ pub struct App {
     pub(crate) tx: Sender<Ev>,
     pub(crate) aliases: BTreeMap<String, String>,
     pub(crate) actions: BTreeMap<String, Trigger>,
+    /// Triggers matched against the prompt — the unterminated tail a server
+    /// leaves sitting there. Separate from `actions` so that a prompt the
+    /// server later completes into a full line fires each kind once, and so
+    /// that `#action {>}` does not start matching every prompt in the game.
+    pub(crate) prompts: BTreeMap<String, Trigger>,
+    /// Function names already complained about, so a missing function inside
+    /// a ticker says so once instead of forty times a minute.
+    pub(crate) warned_fns: BTreeSet<String>,
+    /// Start of the second currently being counted, and how many lines a
+    /// trigger, event or their timers have sent inside it. The loop this
+    /// bounds runs across the network, where the expansion-depth limits
+    /// cannot see it.
+    pub(crate) burst_start: Instant,
+    pub(crate) burst_n: u32,
+    pub(crate) burst_warned: bool,
     pub(crate) highlights: BTreeMap<String, String>,
     pub(crate) subs: BTreeMap<String, String>,
     pub(crate) gags: BTreeSet<String>,
@@ -335,6 +359,11 @@ impl App {
             tx,
             aliases: BTreeMap::new(),
             actions: BTreeMap::new(),
+            prompts: BTreeMap::new(),
+            warned_fns: BTreeSet::new(),
+            burst_start: Instant::now(),
+            burst_n: 0,
+            burst_warned: false,
             highlights: BTreeMap::new(),
             subs: BTreeMap::new(),
             gags: BTreeSet::new(),
@@ -456,6 +485,18 @@ impl App {
     // ---- variables & substitution ---------------------------------------
 
     pub fn get_var(&self, name: &str) -> Option<String> {
+        // $inv[%*] is every item of the list at once, which is how tt++
+        // writes an iteration: #foreach {$prey[%*]} {t} {kill $t}. Joined
+        // with `;` because that is what #foreach splits on.
+        //
+        // Here rather than in the substituter for the same reason as the
+        // signed subscripts below: in the parser a subscript is still text,
+        // and only this layer knows what a list is.
+        if let Some((base, sub)) = crate::list::split_key(name)
+            && sub.trim() == "%*"
+        {
+            return Some(crate::list::items(&self.vars, base).join(";"));
+        }
         // $inv[-1] and $inv[+1] are positions in a list, not names. Rewriting
         // here rather than in the substituter keeps it in one place and keeps
         // it out of the parser, where a subscript is still just text.
@@ -469,14 +510,23 @@ impl App {
         if let Some(v) = self.vars.get(name) {
             return Some(v.clone());
         }
-        // `$session` is where this is running, not something anyone set.
+        // `$session` is where this is running, and `$connected` is whether
+        // it has a socket. Neither is something anyone set.
         //
         // A trigger fires in the focus of the session whose line set it off,
         // and until now it had no way to ask which one that was — so three
         // characters logging in needed three near-identical triggers instead
-        // of one. Last, so a variable the player did define still wins and no
+        // of one. $connected is the other half: without it #all shouts at
+        // sessions that are down, which during a server restart buries the
+        // reconnect messages under one refusal per command per session.
+        //
+        // Last, so a variable the player did define still wins and no
         // existing script changes meaning.
-        (name == "session").then(|| self.s().name.clone())
+        match name {
+            "session" => Some(self.s().name.clone()),
+            "connected" => Some(if self.s().conn.is_some() { "1" } else { "0" }.to_string()),
+            _ => None,
+        }
     }
 
     /// Update the innermost scope that has the name, else set globally.
@@ -539,6 +589,26 @@ impl App {
                 || bytes.get(j) != Some(&b'{')
                 || !self.functions.contains_key(name)
             {
+                // Shaped like a call but naming nothing. Left as text, which
+                // is the old behaviour and harmless — but said out loud,
+                // because silence here is expensive: `#if {@playing{} == 1}`
+                // then compares the string "@playing{}" to "1", is false
+                // forever, and the branch simply never runs. A rewrite that
+                // dropped one #function definition cost two full runs against
+                // a live server, with nothing in the transcript to point at.
+                //
+                // Safe to say: `@` is in META, so server text always arrives
+                // with it escaped and can never reach here as a call.
+                if !name.is_empty()
+                    && bytes.get(j) == Some(&b'{')
+                    && self.warned_fns.insert(name.to_string())
+                {
+                    let name = name.to_string();
+                    self.info(&format!(
+                        "no function {{{}}} — @{}{{}} is being left as text",
+                        name, name
+                    ));
+                }
                 out.push('@');
                 i += 1;
                 continue;
@@ -739,18 +809,28 @@ impl App {
     fn finish_connect(&mut self, conn: Conn, host: &str, port: u16, how: Recipe) {
         let kind = conn.kind();
         self.s_mut().conn = Some(conn);
-        // Remember how we got here before anything can go wrong with it, and
-        // treat arriving as proof the backoff has done its job.
+        // Remember how we got here before anything can go wrong with it.
+        //
+        // Arriving is NOT proof that the backoff has done its job, which is
+        // what this used to assume. A server that accepts the socket and then
+        // turns you away — a door limit, a ban, a full server — would reset
+        // the counter on every attempt, so the escalation never engaged and
+        // judytin knocked once a second forever. The credit is given on the
+        // way down instead, to a connection that lasted.
         self.s_mut().recipe = Some(how);
         self.s_mut().retry_at = None;
-        self.s_mut().retry_n = 0;
+        self.s_mut().up_since = Some(Instant::now());
+        self.s_mut().pending_connect = false;
         // A connection that has not spoken yet may still be negotiating. Hold
         // player text until it has, so the first thing judytin says is not sent
         // over the top of the first thing it was told.
         let cap = Instant::now() + Self::SETTLE;
         self.s_mut().settling = Some(cap);
         self.s_mut().settle_cap = Some(cap);
-        self.s_mut().held.clear();
+        // Deliberately not cleared: a piped script queues its first commands
+        // before this connection exists, and they are meant for it. Text left
+        // over from a connection that went away is dropped by drop_held on
+        // the way out, so there is nothing stale to inherit here.
         self.s_mut().host = host.to_string();
         self.s_mut().port = port;
         self.s_mut().telnet = Telnet::new();
@@ -828,7 +908,7 @@ impl App {
             );
             self.info(&msg);
         }
-        if self.s().name.is_empty() && self.s().conn.is_none() {
+        if self.s().name.is_empty() && self.s().conn.is_none() && !self.s().pending_connect {
             self.s_mut().name = name.to_string();
             return true;
         }
@@ -886,6 +966,10 @@ impl App {
         self.sessions.iter().position(|x| x.conn_id == conn_id)
     }
 
+    /// How long a connection must last before it counts as having worked.
+    /// Below this, whatever happened was a refusal wearing a handshake.
+    const COUNTS_AS_UP: Duration = Duration::from_secs(10);
+
     /// How long to wait before attempt `n`. Grows to half a minute and stays
     /// there — a server being rebuilt can be gone for a while, and hammering
     /// it helps nobody.
@@ -908,6 +992,17 @@ impl App {
     pub(crate) fn arm_reconnect(&mut self) {
         if !self.reconnect_on || self.s().recipe.is_none() {
             return;
+        }
+        // A connection that stayed up long enough to have been worth having
+        // clears the escalation. One that died on arrival does not: that is
+        // the case where backing off is the whole point.
+        if self
+            .s_mut()
+            .up_since
+            .take()
+            .is_some_and(|t| t.elapsed() >= Self::COUNTS_AS_UP)
+        {
+            self.s_mut().retry_n = 0;
         }
         let wait = Self::backoff(self.s().retry_n);
         self.s_mut().retry_at = Some(Instant::now() + wait);
@@ -994,6 +1089,21 @@ impl App {
         }
     }
 
+    /// Whether a piped run has anything left to wait for: a session still
+    /// connected, or one expecting to be.
+    ///
+    /// Asking about *the current session* was right when judytin held one,
+    /// and wrong the moment it could hold four — the focus is wherever the
+    /// script last put it, so a #session that failed to connect would take
+    /// three live characters down with it. Both exit paths ask this, so they
+    /// cannot drift apart again: they already had, and the stdin one was
+    /// still killing crews after the socket one was fixed.
+    fn still_waiting(&self) -> bool {
+        self.sessions
+            .iter()
+            .any(|x| x.conn.is_some() || x.retry_at.is_some())
+    }
+
     /// How long a new connection gets to say something before judytin gives up
     /// waiting and sends anyway. Only a backstop: a server that greets you —
     /// which is nearly all of them — releases the hold in milliseconds.
@@ -1016,10 +1126,52 @@ impl App {
 
     /// Send one line to the MUD. A sink: escaped data becomes plain text
     /// here, on its way out of the client's grammar for good.
+    /// Most lines a trigger, event or their timers may send in one second.
+    ///
+    /// Generous: a script driving four characters through a fight sends a few
+    /// dozen. The thing on the other side of this number is not a busy script
+    /// but a loop — server prompts, trigger answers, server prompts again —
+    /// which on a local socket managed roughly 350,000 round trips in forty
+    /// seconds and only stopped when the server gave up.
+    const SERVER_DRIVEN_PER_SEC: u32 = 100;
+
+    /// Whether a server-caused send may go out, counting it if so.
+    ///
+    /// Only server-caused sends are counted. Anything the player typed, and
+    /// anything a timer they started is doing, is their own business and is
+    /// never throttled — that is the difference between a script that is busy
+    /// and a conversation that has started answering itself.
+    fn burst_allows_send(&mut self) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.burst_start) >= Duration::from_secs(1) {
+            self.burst_start = now;
+            self.burst_n = 0;
+            // A whole second inside the limit means whatever it was is over,
+            // so the next episode is worth reporting again.
+            self.burst_warned = false;
+        }
+        self.burst_n += 1;
+        if self.burst_n <= Self::SERVER_DRIVEN_PER_SEC {
+            return true;
+        }
+        if !self.burst_warned {
+            self.burst_warned = true;
+            self.info(&format!(
+                "a trigger has sent {} lines in a second and is being held \
+                 here — something the server says is setting off a trigger \
+                 whose reply makes the server say it again. #unaction the \
+                 pattern, or #zap to leave.",
+                Self::SERVER_DRIVEN_PER_SEC
+            ));
+        }
+        false
+    }
+
     pub fn send_line(&mut self, line: &str) {
         let line = &crate::data::unescape(line);
-        if self.s().conn.is_none() {
-            self.info(&format!("not connected — cannot send '{}'. try #session", line));
+        // The ceiling is checked before anything else so a loop cannot be
+        // spent on error messages either.
+        if self.server_driven > 0 && !self.burst_allows_send() {
             return;
         }
         // A connection that has not spoken yet may be mid-negotiation, and with
@@ -1027,11 +1179,56 @@ impl App {
         // dialogue before the first prompt lands. Queue instead; the server's
         // first byte, or SETTLE, lets it go. Telnet replies do not come through
         // here, so an option is still answered the instant it is offered.
+        //
+        // Checked before "not connected" on purpose: at startup the settle is
+        // armed while the socket is still being opened, so a piped script's
+        // first command waits for the connection instead of being refused by
+        // it. Nothing else reaches this state — #session arms the settle only
+        // once it has connected.
         if self.s().settling.is_some() {
             self.s_mut().held.push_back(line.to_string());
             return;
         }
+        if self.s().conn.is_none() {
+            self.info(&format!("not connected — cannot send '{}'. try #session", line));
+            return;
+        }
         self.send_now(line);
+    }
+
+    /// Queue what the script says until the connection judytin is about to
+    /// open has been made and has spoken.
+    ///
+    /// Startup used to connect first and read the piped script afterwards, so
+    /// the server's greeting had a head start on the triggers written to
+    /// catch it: a login #action could register after the door prompt it was
+    /// written for had already gone by, and the character sat there forever.
+    /// Reading the script first fixes that, and this is what stops the script
+    /// being told "not connected" while it waits.
+    pub(crate) fn hold_until_connected(&mut self) {
+        let cap = Instant::now() + Self::SETTLE;
+        self.s_mut().settling = Some(cap);
+        self.s_mut().settle_cap = Some(cap);
+        self.s_mut().pending_connect = true;
+    }
+
+    /// Run `f` in the session the command line's connection is meant for.
+    ///
+    /// The script is read before the socket is opened, and a script may open
+    /// sessions of its own and leave the focus on one of them. The connection
+    /// asked for on the command line still belongs to the session that was
+    /// there first.
+    pub(crate) fn on_pending_session<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let i = self
+            .sessions
+            .iter()
+            .position(|x| x.pending_connect)
+            .unwrap_or(0);
+        self.on_session(i, f)
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        self.s().conn.is_some()
     }
 
     fn send_now(&mut self, line: &str) {
@@ -1076,7 +1273,7 @@ impl App {
             }
             Ev::Line(line) => self.handle_user_line(&line),
             Ev::StdinEof => {
-                if self.s().conn.is_none() {
+                if !self.still_waiting() {
                     self.quit = true;
                 } else {
                     // Staying is deliberate — it is how `printf 'look\n' |
@@ -1154,16 +1351,7 @@ impl App {
             // the player typing the game's own quit, so it only chases
             // when asked to.
             self.arm_reconnect();
-            // A piped run ends when there is nothing left to wait for: no
-            // session still connected, and none expecting to be. Asking only
-            // about the session that just closed was right when judytin held
-            // one, and wrong the moment it could hold four — the first socket
-            // to go would take the live ones with it.
-            let waiting = self
-                .sessions
-                .iter()
-                .any(|x| x.conn.is_some() || x.retry_at.is_some());
-            if matches!(self.ui, Ui::Dumb) && !waiting {
+            if matches!(self.ui, Ui::Dumb) && !self.still_waiting() {
                 self.quit = true;
             }
         }
@@ -1388,7 +1576,8 @@ impl App {
     }
 
     /// Display any not-yet-shown part of the current unterminated line
-    /// (usually the prompt). Shown raw; triggers run on line completion.
+    /// (usually the prompt). Shown raw; #prompt triggers match it here,
+    /// #action triggers wait for the line to be completed.
     fn flush_partial(&mut self) {
         self.flush_deadline = None;
         if self.s().line_buf.len() > self.s().line_written {
@@ -1397,8 +1586,92 @@ impl App {
             self.output(&frag);
             let full = self.s().line_buf.clone();
             let (plain, _) = strip_map(&full);
+            // Prompt triggers first, then the event: the same order as a
+            // completed line, where actions run before RECEIVED LINE.
+            //
+            // Only when there is something to match. A colour change can be
+            // left parked with no visible text behind it — judymud does this
+            // constantly — and matching that fires every catch-all pattern
+            // against an empty string, which is a bot acting on nothing. The
+            // event still fires: its %1 is the raw text, which is not empty.
+            if !plain.trim().is_empty() {
+                for body in self.collect_triggers(true, &plain) {
+                    self.run_server_body(&body, 1);
+                }
+            }
             self.fire_event("RECEIVED PROMPT", &[full, plain]);
         }
+    }
+
+    /// Bodies of every trigger matching `plain`, with captures already
+    /// resolved, counting down any that were limited by #oneshot/#multishot.
+    ///
+    /// expand_data, not expand: these captures are server text, and this is
+    /// the boundary where they must stop being able to become code. Both
+    /// trigger kinds cross it, so both come through here.
+    fn collect_triggers(&mut self, prompt: bool, plain: &str) -> Vec<String> {
+        let table = if prompt { &self.prompts } else { &self.actions };
+        let mut to_run: Vec<String> = Vec::new();
+        let mut spent: Vec<String> = Vec::new();
+        for (pat, trig) in table {
+            if let Some(caps) = pattern::matches(pat, plain) {
+                to_run.push(pattern::expand_data(&trig.body, &caps, plain));
+                if trig.shots.is_some() {
+                    spent.push(pat.clone());
+                }
+            }
+        }
+        for pat in spent {
+            let table = if prompt { &mut self.prompts } else { &mut self.actions };
+            if let Some(t) = table.get_mut(&pat) {
+                let left = t.shots.unwrap_or(1).saturating_sub(1);
+                if left == 0 {
+                    table.remove(&pat);
+                } else {
+                    t.shots = Some(left);
+                }
+            }
+        }
+        to_run
+    }
+
+    /// Remove a prompt from the front of a line, when the script has said
+    /// what its prompt looks like.
+    ///
+    /// `written` catches the prompt that sat on screen before its message
+    /// arrived, which is most of them. It cannot catch the one where the
+    /// server wrote both in a single packet: nothing separates them then —
+    /// no newline, no packet boundary, no pause — and the buffer genuinely is
+    /// one line by every structural measure there is. A start-anchored
+    /// capture was poisoned by that intermittently, which is worse to debug
+    /// than always.
+    ///
+    /// A `#prompt` pattern is the script saying "this shape is my prompt".
+    /// Taking it at its word costs nothing and needs no heuristic: if one
+    /// matches at position zero and there is a message behind it, the message
+    /// is what the line is about. Nothing is stripped when no #prompt is
+    /// registered, so this changes nothing for a script that does not use it.
+    ///
+    /// The prompt is not lost: it fired its own triggers when it was shown.
+    fn strip_leading_prompt(&self, line: String) -> String {
+        if self.prompts.is_empty() || line.is_empty() {
+            return line;
+        }
+        for pat in self.prompts.keys() {
+            let Some((start, end, _)) = pattern::find(&pattern::compile(pat), &line) else {
+                continue;
+            };
+            // At the front, and leaving something behind. A prompt that is
+            // the whole line is a prompt-only line, and stripping it to
+            // nothing would silence triggers rather than aim them.
+            if start == 0 && end < line.len() {
+                let rest = line[end..].trim_start();
+                if !rest.is_empty() {
+                    return rest.to_string();
+                }
+            }
+        }
+        line
     }
 
     fn complete_line(&mut self) {
@@ -1406,31 +1679,44 @@ impl App {
         let written = std::mem::take(&mut self.s_mut().line_written);
         let (plain, _) = strip_map(&raw);
 
-        // Collect matching action bodies (and count down multishots).
-        // expand_data, not expand: these captures are server text, and this
-        // is the boundary where they must stop being able to become code.
-        let mut to_run: Vec<String> = Vec::new();
-        let mut spent: Vec<String> = Vec::new();
-        for (pat, trig) in &self.actions {
-            if let Some(caps) = pattern::matches(pat, &plain) {
-                to_run.push(pattern::expand_data(&trig.body, &caps, &plain));
-                if trig.shots.is_some() {
-                    spent.push(pat.clone());
-                }
-            }
-        }
-        for pat in spent {
-            if let Some(t) = self.actions.get_mut(&pat) {
-                let left = t.shots.unwrap_or(1).saturating_sub(1);
-                if left == 0 {
-                    self.actions.remove(&pat);
-                } else {
-                    t.shots = Some(left);
-                }
-            }
-        }
+        // What the triggers see. When part of this line was already shown as
+        // a prompt, that part is not part of the message.
+        //
+        // A MUD parks its status prompt with no newline and sends the next
+        // message behind it. Matching the whole buffer means every pattern
+        // anchored at the start of a line silently captures the prompt too:
+        // {%1 starts following you} yielded "30/30hp 12/12m 0g> Magcoyb", and
+        // the bot that sent `group` with it got "They are not here." for three
+        // minutes with nothing on screen looking wrong.
+        //
+        // The test is whether anything actually arrived after the part that
+        // was shown, and it has to be, because judymud's framing is:
+        //
+        //   packet: "The Cityguard leaves down."          (no terminator)
+        //   packet: "\r\n\r\n26/26hp 21/21m 0g> "         (ends it, new prompt)
+        //
+        // So an ordinary message is shown before its newline arrives, and
+        // `written` reaches the end of the buffer. Stripping there would throw
+        // the whole message away — a first version of this did exactly that
+        // and every trigger in the client stopped firing.
+        //
+        // The prompt case is the one where more text followed what was shown:
+        // prompt parked and displayed, message appended behind it, terminator
+        // last. Then, and only then, the shown part is a prompt and not part
+        // of the message.
+        //
+        // A line genuinely split inside the packet-patch window is unaffected
+        // either way: nothing was shown, so `written` stays zero.
+        let matched = if written > 0 && written < raw.len() {
+            strip_map(&raw[written..]).0
+        } else {
+            plain.clone()
+        };
+        let matched = self.strip_leading_prompt(matched);
 
-        let mut gagged = self.gags.iter().any(|g| pattern::matches(g, &plain).is_some());
+        let to_run = self.collect_triggers(false, &matched);
+
+        let mut gagged = self.gags.iter().any(|g| pattern::matches(g, &matched).is_some());
         if self.gag_next > 0 {
             self.gag_next -= 1;
             gagged = true;
@@ -1459,7 +1745,7 @@ impl App {
         for body in to_run {
             self.run_server_body(&body, 1);
         }
-        self.fire_event("RECEIVED LINE", &[raw, plain]);
+        self.fire_event("RECEIVED LINE", &[raw, matched]);
     }
 
     fn apply_subs_and_highlights(&self, mut raw: String) -> String {
